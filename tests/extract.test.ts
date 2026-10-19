@@ -449,6 +449,8 @@ test("応募の再試行中に届いた続報は保留し、応募の後に処�
 test("ラベルの後に別の文が続く題名は採らず、ラベルと題名だけの行は採る", async () => {
   expect(extractTitle("題名: 型の話。PRIVATE-NOTE の件は後で連絡します")).toBeUndefined();
   expect(extractTitle("題名: 型の話。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
+  expect(extractTitle("題名: 型の話、あと懇親会は欠席です")).toBeUndefined();
+  expect(extractTitle("Title: Types, see you")).toBeUndefined();
   expect(extractTitle("Title: Types. PRIVATE-NOTE please contact me later")).toBeUndefined();
   expect(extractTitle("I will talk. Title: Types")).toBeUndefined();
   expect(extractTitle("10/23 に「型の話」で応募します")).toBeUndefined();

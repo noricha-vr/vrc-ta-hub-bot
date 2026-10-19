@@ -43,7 +43,7 @@ export function mergeMaterials(...groups: readonly Material[][]): Material[] {
 export const MAX_TITLE_LENGTH = 80;
 const QUOTED = /^(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』|"([^「」『』"“”]+)"|“([^「」『』"“”]+)”)$/;
 const LABELLED = /^(?:題名|タイトル|演題|title)(?:\s*[:：]\s*|\s+)(.+)$/i;
-const PLAIN_FORBIDDEN = /[。．.!?！？「」『』"“”]/;
+const PLAIN_FORBIDDEN = /[。．.!?！？、，,「」『』"“”]/;
 const UNSAFE = /https?:\/\/|<@|@everyone|@here/i;
 
 const quotedTitle = (text: string): string | undefined => {
