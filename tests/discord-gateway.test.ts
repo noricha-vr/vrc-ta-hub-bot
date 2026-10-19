@@ -234,3 +234,28 @@ test("an initial membership fetch interrupted by a disconnect is retried on the 
     expect(calls).toEqual(["reconnecting", ["100"], "connected"]);
   } finally { await gateway.stop(); }
 });
+
+test("a failed /hub command registration is retried on the next ready", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  client.guilds.fetch = (async () => new Map()) as never;
+  let attempts = 0;
+  (client as unknown as { application: unknown }).application = { commands: { create: async () => {
+    attempts++; if (attempts === 1) throw new Error("rest down");
+  } } };
+  const errors: string[] = [];
+  gateway.subscribe({ connected: () => {}, disconnected: () => {}, reconnecting: () => {}, message: () => {},
+    error: () => { errors.push("error"); }, fatal: () => {}, guildsReady: () => {}, interaction: () => {} });
+  try {
+    client.emit(Events.ClientReady, client as Client<true>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(errors).toEqual(["error"]);
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(attempts).toBe(2);
+  } finally { await gateway.stop(); }
+});

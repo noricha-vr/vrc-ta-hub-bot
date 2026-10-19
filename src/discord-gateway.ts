@@ -52,9 +52,11 @@ export class DiscordGateway implements Gateway {
       } catch { if (current(mine)) events.fatal(); return; }
       if (!current(mine)) return;
       events.connected();
-      if (!commandRegistered && events.interaction) {
+      if (!commandRegistered && events.interaction && this.client.application) {
+        // 登録できた時だけ済みにする。失敗したら次の ShardReady でもう一度試す。
         commandRegistered = true;
-        void this.client.application?.commands.create(hubCommand.toJSON()).catch(() => events.error());
+        void this.client.application.commands.create(hubCommand.toJSON())
+          .catch(() => { commandRegistered = false; events.error(); });
       }
     };
     const onReady = () => { clientReady = true; void reconcileReady(); };
