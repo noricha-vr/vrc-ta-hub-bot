@@ -18,6 +18,8 @@ export interface GatewayMessage {
 export interface HistoryQuery {
   after?: string;
   before?: string;
+  /** 指定 ID の前後を取る（再試行で 1 件を取り直す時に使う）。after / before と併用しない。 */
+  around?: string;
   limit: number;
 }
 

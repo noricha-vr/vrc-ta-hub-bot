@@ -29,6 +29,14 @@ export class JudgeError extends Error {
 
 export type JudgeFetch = (url: string, init: RequestInit) => Promise<Response>;
 
+/** 判定 API の choice 応答（{type:"choice", choice, confidence}）を内部の形に変換する。 */
+export function fromWireAnswer(value: unknown): ChoiceAnswer | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const wire = value as { type?: unknown; choice?: unknown; confidence?: unknown };
+  if (wire.type !== "choice" || typeof wire.choice !== "string" || typeof wire.confidence !== "number") return undefined;
+  return { answer: wire.choice, confidence: wire.confidence };
+}
+
 export function validAnswer(value: unknown, criteria: Record<string, string>): value is ChoiceAnswer {
   if (!value || typeof value !== "object") return false;
   const answer = value as Partial<ChoiceAnswer>;
@@ -85,7 +93,7 @@ export class JevJudge implements Judge {
     const answers = data.answers as Record<string, unknown>;
     const result: Record<string, ChoiceAnswer> = {};
     for (const [name, question] of Object.entries(request.questions)) {
-      const value = answers[name];
+      const value = fromWireAnswer(answers[name]);
       if (!validAnswer(value, question.criteria)) throw new JudgeError("invalid_response");
       result[name] = { answer: value.answer, confidence: value.confidence };
     }

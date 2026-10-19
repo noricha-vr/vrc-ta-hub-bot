@@ -40,6 +40,20 @@ export function mergeMaterials(...groups: readonly Material[][]): Material[] {
   return [...materials.values()];
 }
 
+export const MAX_TITLE_LENGTH = 80;
+const TITLE_LABEL = /(?:題名|タイトル|演題|title)\s*[:：]\s*(.+)$/i;
+const TITLE_QUOTES = [/「([^「」]+)」/, /『([^『』]+)』/, /“([^“”]+)”/, /"([^"]+)"/];
+
+/** 選ばれた行から題名の部分だけを切り出す。切り出せない・長すぎる時は undefined（行全体は使わない）。 */
+export function extractTitle(line: string): string | undefined {
+  const labelled = TITLE_LABEL.exec(line)?.[1]?.trim();
+  const source = labelled ?? line;
+  const quoted = TITLE_QUOTES.map(pattern => pattern.exec(source)?.[1]?.trim()).find(Boolean);
+  const title = quoted ?? labelled;
+  if (!title || [...title].length > MAX_TITLE_LENGTH || /https?:\/\/|<@|@everyone|@here/i.test(title)) return undefined;
+  return title;
+}
+
 export type DateResolution = { status: "resolved"; date: string }
   | { status: "unresolved"; reason: "missing" | "ambiguous" | "unmatched" };
 
@@ -48,12 +62,19 @@ export function validEventDate(date: string): boolean {
     && new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) === date;
 }
 
-/** 日付は日本時間の投稿日を基準に、ハブから渡された開催日だけに解決する。 */
-export function resolveEventDate(content: string, dates: readonly string[], createdAt: string): DateResolution {
+/**
+ * 日付は日本時間の投稿日を基準に、ハブから渡された開催日だけに解決する。
+ * 応募は投稿日以降の開催日に限る。続報（includePast）は過去の開催日とも照合する。「次回」は常に投稿日以降。
+ */
+export function resolveEventDate(
+  content: string, dates: readonly string[], createdAt: string, { includePast = false } = {},
+): DateResolution {
   const posted = Date.parse(createdAt);
   if (!Number.isFinite(posted)) return { status: "unresolved", reason: "unmatched" };
   const postedDay = new Date(posted + 9 * 3600_000).toISOString().slice(0, 10);
-  const upcoming = [...new Set(dates.filter(date => validEventDate(date) && date >= postedDay))].sort();
+  const known = [...new Set(dates.filter(validEventDate))].sort();
+  const upcoming = known.filter(date => date >= postedDay);
+  const candidates = includePast ? known : upcoming;
   // URL 中の数字は開催日の指定として扱わない。
   const text = content.replace(/https?:\/\/\S+/g, "");
   const matches = [...text.matchAll(/(?<![\d/])(?:(\d{4})[\/年-])?(\d{1,2})[\/月-](\d{1,2})(?:日)?(?![\d/])/g)];
@@ -61,7 +82,7 @@ export function resolveEventDate(content: string, dates: readonly string[], crea
     const selected = new Set<string>();
     for (const match of matches) {
       const [, year, month, day] = match;
-      const found = upcoming.filter(date => (!year || date.slice(0, 4) === year)
+      const found = candidates.filter(date => (!year || date.slice(0, 4) === year)
         && Number(date.slice(5, 7)) === Number(month) && Number(date.slice(8, 10)) === Number(day));
       if (found.length === 0) return { status: "unresolved", reason: "unmatched" };
       for (const date of found) selected.add(date);

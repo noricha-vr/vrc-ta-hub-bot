@@ -6,8 +6,10 @@ const request: JudgeRequest = {
   questions: { category: { type: "choice", instructions: "Select the kind of post.", criteria: { application: "LT application", none: "Uncertain" } } },
 };
 const response = () => Response.json({
-  model: "jev-latest", answers: { category: { answer: "application", confidence: 0.9, probabilities: { application: 0.9, none: 0.1 } } },
-  usage: { input_tokens: 30 },
+  // 2026-10-19 に実測した応答の形。choice は `choice` に入る。
+  model: "jev-1.13.0",
+  answers: { category: { type: "choice", choice: "application", confidence: 0.9, probabilities: { application: 0.9, none: 0.1 } } },
+  usage: { input_tokens: 30, output_tokens: 10 },
 });
 
 test("判定 API の指定された形式を偽 HTTP に送り、回答だけを返す", async () => {
@@ -51,10 +53,14 @@ test("レスポンス本文の読み取りもタイムアウトの対象にす�
   await expect(judge.ask(request)).rejects.toThrow("timeout");
 });
 
-for (const value of [null, {}, { answers: {} }, { answers: { category: { answer: "unknown", confidence: 1 } } },
-  { answers: { category: { answer: "application", confidence: -0.1 } } },
-  { answers: { category: { answer: "application", confidence: 1.1 } } },
-  { answers: { category: { answer: "application", confidence: "0.9" } } }]) {
+const wire = (fields: Record<string, unknown>) => ({ answers: { category: { type: "choice", ...fields } } });
+for (const value of [null, {}, { answers: {} }, wire({ choice: "unknown", confidence: 1 }),
+  wire({ choice: "application", confidence: -0.1 }), wire({ choice: "application", confidence: 1.1 }),
+  wire({ choice: "application", confidence: "0.9" }),
+  // 旧い想定の形（answer キー）と、別の型の回答は受け付けない。
+  { answers: { category: { answer: "application", confidence: 0.9 } } },
+  { answers: { category: { type: "noul", noul: 0.49 } } },
+  { answers: { category: { type: "score", score: 0.41, confidence: 0.18 } } }]) {
   test(`不正な応答 ${JSON.stringify(value)} は判定に使わない`, async () => {
     await expect(new JevJudge("test-placeholder", async () => Response.json(value)).ask(request)).rejects.toThrow("invalid_response");
   });

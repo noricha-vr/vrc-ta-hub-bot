@@ -23,6 +23,35 @@ export type NewTalkDraft = Omit<TalkDraft, "id" | "sources">;
 export type SavedDraft = { status: "candidate"; action: "created" | "updated"; draft: TalkDraft }
   | { status: "duplicate"; draft: TalkDraft };
 
+/** 再試行の記録。本文は持たず、Gateway から取り直すための ID と出典だけ。 */
+export interface PendingPost {
+  meetingId: string;
+  authorId: string;
+  source: PostReference;
+  reason: string;
+  attempts: number;
+  nextAt: number;
+  state: "retry" | "review";
+}
+
+interface PendingRow {
+  meeting_id: string;
+  author_id: string;
+  message_id: string;
+  channel_id: string;
+  source_url: string;
+  reason: string;
+  attempts: number;
+  next_at: number;
+  state: "retry" | "review";
+}
+
+const toPending = (row: PendingRow): PendingPost => ({
+  meetingId: row.meeting_id, authorId: row.author_id, reason: row.reason, attempts: row.attempts,
+  nextAt: row.next_at, state: row.state,
+  source: { messageId: row.message_id, channelId: row.channel_id, url: row.source_url },
+});
+
 interface DraftRow {
   id: string;
   meeting_id: string;
@@ -59,6 +88,17 @@ export class ExtractionStore {
         channel_id TEXT NOT NULL,
         source_url TEXT NOT NULL,
         draft_id TEXT NOT NULL REFERENCES talk_drafts(id)
+      );
+      CREATE TABLE IF NOT EXISTS pending_posts (
+        message_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        meeting_id TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        next_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('retry', 'review'))
       );
     `);
   }
@@ -126,6 +166,51 @@ export class ExtractionStore {
   private addSource(id: string, source: PostReference): void {
     this.db.query("INSERT INTO talk_sources (message_id, channel_id, source_url, draft_id) VALUES (?, ?, ?, ?)")
       .run(source.messageId, source.channelId, source.url, id);
+  }
+
+  /** 再試行を記録し、回数を 1 増やして次の時刻を決める。返り値は記録後の回数。 */
+  scheduleRetry(meetingId: string, authorId: string, source: PostReference, reason: string,
+    delaySeconds: (attempts: number) => number, nowSeconds: number): number {
+    return this.db.transaction((): number => {
+      const prior = this.db.query<{ attempts: number }, [string]>(
+        "SELECT attempts FROM pending_posts WHERE message_id = ?").get(source.messageId);
+      const attempts = (prior?.attempts ?? 0) + 1;
+      this.db.query(`INSERT INTO pending_posts
+        (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'retry')
+        ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, attempts = excluded.attempts,
+          next_at = excluded.next_at, state = 'retry'`
+      ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, attempts,
+        nowSeconds + delaySeconds(attempts));
+      return attempts;
+    }).immediate();
+  }
+
+  /** 取り直せない・回数切れの投稿は消さず、確認対象として残す。 */
+  markReview(messageId: string, reason: string): void {
+    this.db.query("UPDATE pending_posts SET state = 'review', reason = ? WHERE message_id = ?").run(reason, messageId);
+  }
+
+  clearPending(messageId: string): void {
+    this.db.query("DELETE FROM pending_posts WHERE message_id = ?").run(messageId);
+  }
+
+  pending(messageId: string): PendingPost | undefined {
+    const row = this.db.query<PendingRow, [string]>("SELECT * FROM pending_posts WHERE message_id = ?").get(messageId);
+    return row ? toPending(row) : undefined;
+  }
+
+  dueRetries(nowSeconds: number, limit = 50): PendingPost[] {
+    return this.db.query<PendingRow, [number, number]>(
+      "SELECT * FROM pending_posts WHERE state = 'retry' AND next_at <= ? ORDER BY next_at, length(message_id), message_id LIMIT ?",
+    ).all(nowSeconds, limit).map(toPending);
+  }
+
+  /** 同じ発表者の投稿で、まだ再試行待ちのもの（応募の可能性がある）。応募待ちの続報同士は数えない。 */
+  hasPendingFrom(meetingId: string, authorId: string, exceptMessageId: string): boolean {
+    return this.db.query<{ n: number }, [string, string, string]>(
+      "SELECT count(*) AS n FROM pending_posts WHERE state = 'retry' AND reason <> 'awaiting_application' AND meeting_id = ? AND author_id = ? AND message_id <> ?",
+    ).get(meetingId, authorId, exceptMessageId)!.n > 0;
   }
 
   counts(): { drafts: number; sourcePosts: number } {
