@@ -123,3 +123,114 @@ test("投稿の表示名・リンク・添付を新着と履歴で同じ形式�
     await gateway.stop();
   }
 });
+
+test("ready uses fetched guild IDs before connected, including an empty membership", async () => {
+  for (const ids of [[], ["100", "200"]]) {
+    const client = new Client(clientOptions);
+    const gateway = new DiscordGateway(client);
+    client.guilds.cache.set("stale-cache-entry", { id: "stale-cache-entry" } as never);
+    client.guilds.fetch = (async () => new Map(ids.map(id => [id, { id }]))) as never;
+    const calls: unknown[] = [];
+    const unsubscribe = gateway.subscribe({ connected: () => { calls.push("connected"); }, disconnected: () => {},
+      reconnecting: () => {}, message: () => {}, error: () => {}, fatal: () => {},
+      guildsReady: guildIds => { calls.push(guildIds); } });
+    try {
+      client.emit(Events.ClientReady, client as Client<true>);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(calls).toEqual([ids, "connected"]);
+      unsubscribe(); client.emit(Events.ClientReady, client as Client<true>);
+      expect(calls).toHaveLength(2);
+    } finally { await gateway.stop(); }
+  }
+});
+
+test("re-identification rechecks guild membership from the fresh fetch before reconnecting", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  client.guilds.cache.set("100", { id: "100" } as never);
+  let currentGuildIds = ["100"];
+  client.guilds.fetch = (async () => new Map(currentGuildIds.map(id => [id, { id }]))) as never;
+  const calls: Array<string[] | "connected"> = [];
+  gateway.subscribe({ connected: () => { calls.push("connected"); }, disconnected: () => {}, reconnecting: () => {},
+    message: () => {}, error: () => {}, fatal: () => {}, guildsReady: ids => { calls.push(ids); } });
+  try {
+    client.emit(Events.ClientReady, client as Client<true>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    currentGuildIds = ["200"];
+    client.guilds.cache.set("stale-cache-entry", { id: "stale-cache-entry" } as never);
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toEqual([["100"], "connected", ["200"], "connected"]);
+  } finally { await gateway.stop(); }
+});
+
+test("membership is fetched across every 200-guild page before reconciling", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  const all = Array.from({ length: 401 }, (_, i) => String(1000 + i));
+  const queries: unknown[] = [];
+  client.guilds.fetch = (async (query: { limit: number; after?: string }) => {
+    queries.push(query);
+    const rest = all.filter(id => !query.after || BigInt(id) > BigInt(query.after));
+    return new Map(rest.slice(0, query.limit).map(id => [id, { id }]));
+  }) as never;
+  const calls: unknown[] = [];
+  gateway.subscribe({ connected: () => {}, disconnected: () => {}, reconnecting: () => {},
+    message: () => {}, error: () => {}, fatal: () => {}, guildsReady: ids => { calls.push(ids); } });
+  try {
+    client.emit(Events.ClientReady, client as Client<true>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toEqual([all]);
+    expect(queries).toEqual([{ limit: 200 }, { limit: 200, after: "1199" }, { limit: 200, after: "1399" }]);
+  } finally { await gateway.stop(); }
+});
+
+test("a membership fetch that finishes after a disconnect does not mark the new connection as ready", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  const pending: Array<() => void> = [];
+  client.guilds.fetch = (() => new Promise(resolve => pending.push(() => resolve(new Map([["100", { id: "100" }]]))))) as never;
+  const calls: unknown[] = [];
+  gateway.subscribe({ connected: () => { calls.push("connected"); }, disconnected: () => {}, reconnecting: () => { calls.push("reconnecting"); },
+    message: () => {}, error: () => {}, fatal: () => {}, guildsReady: ids => { calls.push(ids); } });
+  try {
+    client.emit(Events.ClientReady, client as Client<true>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    pending.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    client.emit(Events.ShardReconnecting, 0);
+    pending.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toEqual([["100"], "connected", "reconnecting"]);
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    pending.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toEqual([["100"], "connected", "reconnecting", ["100"], "connected"]);
+  } finally { await gateway.stop(); }
+});
+
+test("an initial membership fetch interrupted by a disconnect is retried on the next ShardReady", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  const pending: Array<() => void> = [];
+  client.guilds.fetch = (() => new Promise(resolve => pending.push(() => resolve(new Map([["100", { id: "100" }]]))))) as never;
+  const calls: unknown[] = [];
+  gateway.subscribe({ connected: () => { calls.push("connected"); }, disconnected: () => {}, reconnecting: () => { calls.push("reconnecting"); },
+    message: () => {}, error: () => {}, fatal: () => {}, guildsReady: ids => { calls.push(ids); } });
+  try {
+    client.emit(Events.ClientReady, client as Client<true>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    client.emit(Events.ShardReconnecting, 0);
+    pending.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    client.emit(Events.ShardReady, 0, undefined);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(pending).toHaveLength(1);
+    pending.shift()!();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toEqual(["reconnecting", ["100"], "connected"]);
+  } finally { await gateway.stop(); }
+});

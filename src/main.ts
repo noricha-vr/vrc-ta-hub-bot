@@ -4,7 +4,9 @@ import { HubBot } from "./bot";
 import { loadConfig } from "./config";
 import { DiscordGateway } from "./discord-gateway";
 import { acquireLock } from "./lock";
-import { MessageStore } from "./store";
+import { HubStore } from "./hub-store";
+import { HubApi } from "./hub-api";
+import { HubSetup } from "./hub-setup";
 
 // 1 時間ごとの削除の遅れを足しても 24 時間を超えないよう、期限は 23 時間にする。
 export const INBOX_MAX_AGE_SECONDS = 23 * 3600;
@@ -27,7 +29,7 @@ async function main(): Promise<void> {
   mkdirSync(config.dataDir, { recursive: true, mode: DIR_MODE });
   chmodSync(config.dataDir, DIR_MODE);
   const release = acquireLock(join(config.dataDir, "bot.lock"));
-  let store: MessageStore | undefined;
+  let store: HubStore | undefined;
   let bot: HubBot | undefined;
   let shutdownTask: Promise<void> | undefined;
   const shutdown = (failed: boolean): Promise<void> => {
@@ -45,14 +47,18 @@ async function main(): Promise<void> {
   };
   try {
     const dbPath = join(config.dataDir, "state.sqlite");
-    store = new MessageStore(dbPath);
+    store = new HubStore(dbPath);
     restrictDataPermissions(config.dataDir, dbPath);
     // 本文は処理待ちの間だけ持つ。取り残しも 1 日で消す。
     const opened = store;
     opened.purge(INBOX_MAX_AGE_SECONDS);
     setInterval(() => { try { opened.purge(INBOX_MAX_AGE_SECONDS); } catch { log("inbox_purge_failed"); } }, INBOX_PURGE_INTERVAL_MS).unref();
-    bot = new HubBot(new DiscordGateway(), store, {
-      channelIds: config.channelIds,
+    const gateway = new DiscordGateway();
+    const hub = new HubSetup(gateway, opened, new HubApi(config.hubBaseUrl, config.hubApiKey), () => bot?.refreshChannels(), log);
+    bot = new HubBot(gateway, store, {
+      channelIds: () => opened.channelIds(),
+      baseline: channelId => opened.baseline(channelId),
+      hub,
       healthPath: join(config.dataDir, "health.json"),
       log,
       onFatal: () => { void shutdown(true).finally(() => process.exit(1)); },

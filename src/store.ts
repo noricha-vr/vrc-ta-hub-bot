@@ -3,7 +3,7 @@ import { compareIds, type GatewayMessage } from "./gateway";
 
 /** Durable inbox. A cursor only acknowledges messages already stored here. */
 export class MessageStore {
-  private readonly db: Database;
+  protected readonly db: Database;
 
   constructor(path: string) {
     this.db = new Database(path, { create: true, strict: true });
@@ -66,7 +66,7 @@ export class MessageStore {
   }
 
   /** secure_delete で上書きした頁を本体へ戻し、本文の残る WAL を空にする。 */
-  private truncateWal(): void {
+  protected truncateWal(): void {
     // 読み取り中の接続があると例外ではなく busy=1 が返る。成功扱いにせず呼び出し元で再試行させる。
     const result = this.db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get();
     if (!result || result.busy !== 0) throw new Error("WAL checkpoint incomplete");

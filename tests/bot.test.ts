@@ -57,7 +57,7 @@ describe("durable gateway ingestion", () => {
     expect(f.store.messages("12")).toEqual([]);
     expect(f.store.cursor("10")).toBe("9007199254740995");
     expect(f.store.cursor("11")).toBe("6");
-    expect(f.gateway.queries[0]?.query).toEqual({ limit: 100 });
+    expect(f.gateway.queries[0]?.query).toEqual({ after: "9007199254740993", limit: 100 });
     expect(f.health().reconnectCount).toBe(1);
     expect(f.health().recoveredMessageCount).toBe(3);
     expect(f.health().pendingChannelCount).toBe(0);
@@ -66,6 +66,7 @@ describe("durable gateway ingestion", () => {
   test("fills a gap larger than 100 messages without skipping a page", async () => {
     const f = fixture();
     f.store.save(message(1), true);
+    f.gateway.afterDirection = "nearest";
     f.gateway.history = Array.from({ length: 252 }, (_, index) => message(index + 1));
     await f.bot.start("fake");
     await f.bot.reconcile();
@@ -73,7 +74,7 @@ describe("durable gateway ingestion", () => {
     expect(f.store.cursor("10")).toBe("252");
     expect(f.health().recoveredMessageCount).toBe(251);
     expect(f.gateway.queries.map(item => item.query)).toEqual([
-      { limit: 100 }, { before: "153", limit: 100 }, { before: "53", limit: 100 },
+      { after: "1", limit: 100 }, { after: "101", limit: 100 }, { after: "201", limit: 100 },
     ]);
   });
 
@@ -103,9 +104,10 @@ describe("durable gateway ingestion", () => {
   test("partial recovery failure keeps cursor and safely retries without duplicates", async () => {
     const f = fixture();
     f.store.save(message(1), true);
+    f.gateway.afterDirection = "nearest";
     f.gateway.history = Array.from({ length: 151 }, (_, index) => message(index + 1));
     f.gateway.beforeFetch = async (_channelId, query) => {
-      if (query.before) throw new Error("temporary network failure");
+      if (query.after === "101") throw new Error("temporary network failure");
     };
     await f.bot.start("fake");
     await f.bot.reconcile();
@@ -251,4 +253,68 @@ describe("durable gateway ingestion", () => {
     expect(f.store.cursor("10")).toBe("1");
     expect(f.store.messages("10")).toEqual([message(1)]);
   });
+});
+
+test("history starts after the setup boundary and discards unexpectedly returned older IDs", async () => {
+  const f = fixture();
+  f.store.advance("10", "100");
+  f.gateway.fetchMessages = async (channelId, query) => {
+    f.gateway.queries.push({ channelId, query });
+    return [message(99), message(101), message(100)];
+  };
+  await f.bot.start("fake"); await f.bot.reconcile();
+  expect(f.gateway.queries[0]).toEqual({ channelId: "10", query: { after: "100", limit: 100 } });
+  expect(f.store.messages("10").map(m => m.id)).toEqual(["101"]);
+  expect(f.store.cursor("10")).toBe("101");
+});
+
+test("history recovery only requests after pages and never fetches at or below the setup boundary", async () => {
+  const f = fixture();
+  f.store.advance("10", "100");
+  f.gateway.history = Array.from({ length: 200 }, (_, n) => message(n + 1));
+  await f.bot.start("fake"); await f.bot.reconcile();
+  expect(f.gateway.queries.map(item => item.query)).toEqual([
+    { after: "100", limit: 100 }, { after: "200", limit: 100 },
+  ]);
+  expect(f.gateway.responses.every(response => response.query.after !== undefined)).toBe(true);
+  expect(f.gateway.responses.flatMap(response => response.ids).every(id => BigInt(id) > 100n)).toBe(true);
+  expect(f.store.messages("10").map(item => item.id)).toEqual(Array.from({ length: 100 }, (_, n) => String(n + 101)));
+  expect(f.store.cursor("10")).toBe("200");
+});
+
+test("after pagination sorts IDs and advances with each page maximum", async () => {
+  const f = fixture();
+  f.store.advance("10", "100");
+  f.gateway.afterDirection = "nearest";
+  f.gateway.history = Array.from({ length: 451 }, (_, n) => message(n + 1));
+  await f.bot.start("fake"); await f.bot.reconcile();
+  expect(f.gateway.queries.map(item => item.query)).toEqual([
+    { after: "100", limit: 100 }, { after: "200", limit: 100 },
+    { after: "300", limit: 100 }, { after: "400", limit: 100 },
+  ]);
+  expect(f.gateway.queries.every(item => item.query.after !== undefined)).toBe(true);
+  expect(f.store.messages("10").map(item => item.id)).toEqual(Array.from({ length: 351 }, (_, n) => String(n + 101)));
+  expect(f.store.cursor("10")).toBe("451");
+  expect(f.health().pendingChannelCount).toBe(0);
+});
+
+test("recovery caps each channel at 20 pages and lets other channels progress", async () => {
+  const f = fixture(["10", "11"]);
+  f.gateway.afterDirection = "nearest";
+  f.gateway.history = [...Array.from({ length: 2050 }, (_, n) => message(n + 1)), message(7, "11")];
+  await f.bot.start("fake"); await f.bot.reconcile();
+  expect(f.gateway.queries.filter(item => item.channelId === "10")).toHaveLength(20);
+  expect(f.gateway.queries.some(item => item.channelId === "11")).toBe(true);
+  expect(f.store.cursor("10")).toBe("2000");
+  expect(f.store.messages("10")).toHaveLength(2000);
+  expect(f.store.cursor("11")).toBe("7");
+  expect(f.store.messages("11").map(item => item.id)).toEqual(["7"]);
+  expect(f.health().pendingChannelCount).toBe(1);
+  expect(f.logs).toContain("history_recovery_page_limit");
+  await f.bot.reconcile();
+  expect(f.gateway.queries.filter(item => item.channelId === "10")).toHaveLength(21);
+  expect(f.gateway.queries.at(-1)?.query).toEqual({ after: "2000", limit: 100 });
+  expect(f.store.cursor("10")).toBe("2050");
+  expect(f.store.messages("10")).toHaveLength(2050);
+  expect(f.health().pendingChannelCount).toBe(0);
 });
