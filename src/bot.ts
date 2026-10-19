@@ -1,10 +1,16 @@
-import type { Gateway, GatewayMessage, HistoryQuery } from "./gateway";
+import type { HubSetup } from "./hub-setup";
+import type { Gateway, GatewayMessage } from "./gateway";
 import { compareIds } from "./gateway";
 import { type Health, writeHealth } from "./health";
 import type { MessageStore } from "./store";
 
+const HISTORY_PAGE_SIZE = 100;
+const HISTORY_PAGES_PER_CHANNEL = 20;
+
 interface BotOptions {
-  channelIds: string[];
+  channelIds: string[] | (() => string[]);
+  baseline?: (channelId: string) => string;
+  hub?: HubSetup;
   healthPath: string;
   heartbeatMs?: number;
   now?: () => Date;
@@ -28,8 +34,7 @@ export class HubBot {
   private unsubscribe: (() => void) | undefined;
 
   constructor(private readonly gateway: Gateway, private readonly store: MessageStore, private readonly options: BotOptions) {
-    if (options.channelIds.length === 0) throw new Error("At least one channel must be selected");
-    this.selected = new Set(options.channelIds);
+    this.selected = new Set(typeof options.channelIds === "function" ? options.channelIds() : options.channelIds);
     this.pending = new Set(this.selected);
     this.now = options.now ?? (() => new Date());
     const startedAt = this.now().toISOString();
@@ -56,6 +61,15 @@ export class HubBot {
       disconnected: () => this.offline("disconnected"),
       reconnecting: () => this.offline("reconnecting"),
       message: message => this.receive(message),
+      interaction: interaction => { void this.options.hub?.handle(interaction); },
+      guildDelete: guildId => {
+        try { this.options.hub?.guildDeleted(guildId); }
+        catch { this.recordError("hub_guild_delete_failed"); }
+      },
+      guildsReady: guildIds => {
+        try { this.options.hub?.guildsReady(guildIds); }
+        catch { this.recordError("hub_guild_reconcile_failed"); throw new Error("Guild reconciliation failed"); }
+      },
       error: () => this.recordError("gateway_error"),
       fatal: () => {
         this.offline("error");
@@ -79,6 +93,21 @@ export class HubBot {
     }
   }
 
+  /** Refresh synchronously after a settings transaction, invalidating in-flight history. */
+  refreshChannels(): void {
+    const next = new Set(typeof this.options.channelIds === "function" ? this.options.channelIds() : this.options.channelIds);
+    this.epoch++;
+    for (const id of this.selected) if (!next.has(id)) {
+      this.selected.delete(id); this.pending.delete(id); this.failures.delete(id);
+    }
+    // Resuming a setting can lower a shared channel's effective cursor.
+    for (const id of next) {
+      this.selected.add(id); this.pending.add(id);
+    }
+    this.publish();
+    void this.reconcile();
+  }
+
   private offline(state: "disconnected" | "reconnecting" | "error"): void {
     if (this.stopped) return;
     this.connected = false;
@@ -90,6 +119,7 @@ export class HubBot {
 
   private receive(message: GatewayMessage): void {
     if (this.stopped || !this.selected.has(message.channelId)) return;
+    if (compareIds(message.id, this.options.baseline?.(message.channelId) ?? "0") <= 0) return;
     this.health.lastReceivedAt = this.now().toISOString();
     try {
       this.store.save(message, this.connected && !this.pending.has(message.channelId));
@@ -138,44 +168,45 @@ export class HubBot {
 
   private async recoverChannel(channelId: string, epoch: number): Promise<void> {
     const failuresAtStart = this.failureGeneration(channelId);
-    const baseline = this.store.cursor(channelId);
+    const cursor = this.store.cursor(channelId);
+    const floor = this.options.baseline?.(channelId) ?? "0";
+    const baseline = compareIds(cursor, floor) >= 0 ? cursor : floor;
     let highWater = baseline;
-    let before: string | undefined;
-    while (this.current(epoch)) {
-      // Start with the latest page and walk backwards to the saved cursor.
-      // This does not depend on which end of the range an `after` query selects.
-      const query: HistoryQuery = before === undefined
-        ? { limit: 100 }
-        : { before, limit: 100 };
-      const page = await this.gateway.fetchMessages(channelId, query);
+    let after = baseline;
+    let exhausted = false;
+    let pages = 0;
+    while (this.current(epoch) && pages < HISTORY_PAGES_PER_CHANNEL) {
+      const page: GatewayMessage[] = await this.gateway.fetchMessages(channelId, { after, limit: HISTORY_PAGE_SIZE });
+      pages++;
       if (!this.current(epoch)) return;
-      if (page.some(message => message.channelId !== channelId)) {
-        throw new Error("History channel mismatch");
-      }
+      if (page.some(message => message.channelId !== channelId)) throw new Error("History page outside requested channel");
       page.sort((a, b) => compareIds(a.id, b.id));
-      if (page.length === 0) break;
-      const oldest = page[0]!.id;
-      if (before !== undefined && compareIds(oldest, before) >= 0) {
-        throw new Error("History pagination made no progress");
-      }
-      for (const message of page) {
-        if (compareIds(message.id, baseline) <= 0) continue;
+      if (page.length === 0) { exhausted = true; break; }
+
+      // Ignore anything at or before the setup/cursor boundary. Sorting makes
+      // page advancement independent of the order returned by the API.
+      const fresh = page.filter(message => compareIds(message.id, baseline) > 0 && compareIds(message.id, after) > 0);
+      for (const message of fresh) {
         if (this.store.save(message)) this.health.recoveredMessageCount++;
-        if (compareIds(message.id, highWater) > 0) highWater = message.id;
         this.health.lastReceivedAt = this.now().toISOString();
       }
       this.publish();
-      if (compareIds(oldest, baseline) <= 0) break;
-      before = oldest;
+
+      const pageHigh = fresh.at(-1)?.id;
+      if (pageHigh && compareIds(pageHigh, highWater) > 0) highWater = pageHigh;
+      if (page.length < HISTORY_PAGE_SIZE) { exhausted = true; break; }
+      if (!pageHigh || compareIds(pageHigh, after) <= 0) throw new Error("History page did not advance");
+      after = pageHigh;
     }
     if (!this.current(epoch)) return;
     // A live save failed while scanning; that message may be newer than our scan.
     // Keep the channel pending so the next reconcile re-reads it.
     if (this.failureGeneration(channelId) !== failuresAtStart) return;
-    // Commit only after the entire gap has been durably saved. Partial scans and
-    // live events during recovery cannot acknowledge unseen older messages.
+    // Each after page is saved before advancing. A full 20-page batch can commit
+    // its scanned prefix and leave the channel pending for the next heartbeat.
     this.store.advance(channelId, highWater);
-    this.pending.delete(channelId);
+    if (exhausted) this.pending.delete(channelId);
+    else this.options.log?.("history_recovery_page_limit");
   }
 
   private recordError(event: string): void {

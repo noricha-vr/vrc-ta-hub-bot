@@ -7,8 +7,22 @@ export function message(id: string | number, channelId = "10"): GatewayMessage {
 export class FakeGateway implements Gateway {
   events: GatewayEvents | undefined;
   history: GatewayMessage[] = [];
+  afterDirection: "latest" | "nearest" = "latest";
   queries: Array<{ channelId: string; query: HistoryQuery }> = [];
+  responses: Array<{ channelId: string; query: HistoryQuery; ids: string[] }> = [];
   stopped = false;
+  leftGuilds: string[] = [];
+  validations: Array<{ guildId: string; channelIds: string[]; purpose: string; userId: string }> = [];
+  beforeValidate?: () => Promise<void>;
+
+  async validateChannels(guildId: string, channelIds: string[], purpose: "read" | "notify", userId: string): Promise<void> {
+    this.validations.push({ guildId, channelIds, purpose, userId });
+    await this.beforeValidate?.();
+  }
+
+  beforeLeave?: () => Promise<void>;
+  async leaveGuild(guildId: string): Promise<void> { this.leftGuilds.push(guildId); await this.beforeLeave?.(); }
+
   failStart = false;
   beforeFetch?: (channelId: string, query: HistoryQuery) => Promise<void>;
 
@@ -28,9 +42,13 @@ export class FakeGateway implements Gateway {
     this.queries.push({ channelId, query });
     await this.beforeFetch?.(channelId, query);
     if (query.around !== undefined) return this.history.filter(item => item.channelId === channelId && item.id === query.around);
-    return this.history.filter(item => item.channelId === channelId
+    const messages = this.history.filter(item => item.channelId === channelId
       && (query.after === undefined || compareIds(item.id, query.after) > 0)
       && (query.before === undefined || compareIds(item.id, query.before) < 0))
-      .sort((a, b) => compareIds(b.id, a.id)).slice(0, query.limit);
+      .sort((a, b) => compareIds(b.id, a.id));
+    const page = query.after !== undefined && this.afterDirection === "nearest"
+      ? messages.slice(-query.limit) : messages.slice(0, query.limit);
+    this.responses.push({ channelId, query, ids: page.map(item => item.id) });
+    return page;
   }
 }

@@ -1,3 +1,5 @@
+import type { HubInteraction } from "./hub-setup";
+
 export interface GatewayAttachment {
   url: string;
   name: string;
@@ -30,6 +32,9 @@ export interface GatewayEvents {
   message(message: GatewayMessage): void;
   error(): void;
   fatal(): void;
+  interaction?(interaction: HubInteraction): void;
+  guildDelete?(guildId: string): void;
+  guildsReady?(guildIds: string[]): void;
 }
 
 /** Only this boundary talks to Discord; tests inject a fake implementation. */
