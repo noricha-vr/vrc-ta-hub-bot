@@ -1,7 +1,7 @@
 # vrc-ta-hub-bot
 VRChat 技術・学術系集会の Discord に入り、LT の応募を VRC 技術学術系 Hub に承認待ちで登録する Bot
 
-現在は Gateway 受信・永続化の土台です。Hub API への登録や投稿処理はまだ行いません。
+主催者が `/hub setup` で集会と読むチャンネルを選ぶと、設定時点より後の投稿だけを受信・保存します。Hub への承認待ち登録は後続の変更で行います。
 
 ## 開発
 
@@ -22,10 +22,9 @@ bunx tsc --noEmit
 | 変数 | 用途 |
 | --- | --- |
 | `DISCORD_TOKEN` | Bot の認証トークン（必須） |
-| `HUB_API_KEY` | Hub API 用の予約設定（必須、現段階では未使用） |
-| `HUB_BASE_URL` | Hub API の HTTP(S) ベース URL（必須、現段階では未使用） |
+| `HUB_API_KEY` | Hub API のキー（必須。`/hub setup` で実行者が主催・スタッフかを確かめる） |
+| `HUB_BASE_URL` | Hub API のベース URL（必須。HTTPS のみ。localhost / 127.0.0.1 だけ HTTP 可） |
 | `JEV_API_KEY` | 後続処理用の予約設定（必須、現段階では未使用） |
-| `DISCORD_CHANNEL_IDS` | 受信・履歴補完するチャンネル ID のカンマ区切り（必須） |
 | `BOT_DATA_DIR` | 状態の保存先（省略時は作業ディレクトリの `data/`） |
 
 ```sh
@@ -35,15 +34,24 @@ bun start
 このコマンドは実際に Discord へ接続します。開発時に接続は不要です。Bot には対象チャンネルの
 View Channel と Read Message History が必要です。Developer Portal で Message Content Intent を有効にします。
 Gateway の intent は Guilds / GuildMessages / MessageContent のみです。
+
+起動しただけでは何も読みません（読むチャンネルは環境変数ではなく `/hub setup` で選びます）。
+以前の `DISCORD_CHANNEL_IDS` は廃止しました。設定してあっても使いません。
 SDK の `allowedMentions: { parse: [], repliedUser: false }` でメンションを無効化しています。
+
+## 集会での使い始め
+
+1. Bot をサーバーに招待する（View Channel・Read Message History・Send Messages）。
+2. ハブで主催かスタッフになっている人が `/hub setup` を実行し、集会・読むチャンネル・通知先を選ぶ。実行者と Bot の両方に、選んだチャンネルの閲覧と履歴の権限が要る。
+3. `/hub status` で状態を確かめる。`/hub pause` で一時停止、`/hub leave` で設定と未承認の下書きを消す。最後の設定を外すと Bot はサーバーから退出する。
 
 ## 取りこぼしの補完
 
 - `src/gateway.ts` のインターフェースを実装すれば、接続部分を差し替えられます。
 - 選択したチャンネルの新着を SQLite の `inbox` に保存します。本文を含むため、保存先へのアクセスを制限してください。
 - メッセージ ID は文字列として保存し、比較は `BigInt` で行います。チャンネルごとに `channel_cursors` を保存します。
-- 起動時・接続再確立時は最新の履歴から最大 100 件ずつ遡り、保存カーソルより新しい ID だけを取り込みます。
-  初回はカーソル `0` から、閲覧可能な全履歴を補完します。
+- 起動時・接続再確立時は、設定ごとのカーソルより後（`after`）を最大 100 件ずつ取り込みます。1 チャンネル 20 ページまでで、残りは次の周期に回します。
+  初回のカーソルは設定時点の境目で、導入前の投稿は取得しません。
 - 補完中・切断中の新着も inbox に保存しますが、カーソルを進めません。全ページの保存成功後に進めます。
   通常受信では inbox とカーソルを同じトランザクションで保存し、重複 ID は無視します。
 - 履歴取得に失敗したチャンネルは 5 秒ごとに再試行します。他のチャンネルの補完は継続します。

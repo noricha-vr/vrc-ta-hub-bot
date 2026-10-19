@@ -210,10 +210,7 @@ export class HubSetup {
     }
     this.leaving.add(s.guildId);
     try {
-      this.mutate(s.guildId, () => {
-        this.store.leave(s.guildId, community.id);
-        if (this.store.settings(s.guildId).length === 0) this.store.markPendingLeave(s.guildId);
-      });
+      this.mutate(s.guildId, () => this.store.leave(s.guildId, community.id, true));
       this.log("hub_left");
       try { await i.edit(text("集会の設定と未承認の下書きを削除しました。")); }
       finally { if (this.store.pendingLeaves().includes(s.guildId)) await this.leaveGuild(s.guildId); }

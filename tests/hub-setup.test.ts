@@ -447,3 +447,11 @@ test("setup is refused while a pending guild leave is being retried", async () =
   expect(f.store.pendingLeaves()).toEqual([]);
   expect(f.store.settings()).toEqual([]);
 });
+
+test("the pending leave is committed with the last setting's deletion even if the WAL truncate fails", async () => {
+  const f = fixture(); await f.setup(["10"]);
+  (f.store as unknown as { truncateWal: () => void }).truncateWal = () => { throw new Error("busy"); };
+  await f.action("leave").catch(() => {});
+  expect(f.store.settings()).toEqual([]);
+  expect(f.store.pendingLeaves()).toEqual(["100"]);
+});

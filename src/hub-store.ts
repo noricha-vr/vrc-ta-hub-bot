@@ -131,7 +131,8 @@ export class HubStore extends MessageStore {
     this.db.query("UPDATE hub_settings SET paused = 1 WHERE guild_id = ? AND community_id = ?").run(guildId, communityId);
   }
 
-  leave(guildId: string, communityId?: number): void {
+  /** pendingLeaveIfEmpty: 最後の設定を消したら、同じトランザクションで退出待ちを記録する。 */
+  leave(guildId: string, communityId?: number, pendingLeaveIfEmpty = false): void {
     this.db.transaction(() => {
       const settings = this.settings(guildId).filter(setting => communityId === undefined || setting.community.id === communityId);
       for (const setting of settings) {
@@ -144,6 +145,7 @@ export class HubStore extends MessageStore {
       }
       else this.db.query("DELETE FROM hub_drafts WHERE guild_id = ? AND community_id = ? AND approved = 0").run(guildId, communityId);
       this.removeOrphanedChannels(settings.flatMap(setting => setting.channelIds));
+      if (pendingLeaveIfEmpty && communityId !== undefined && this.settings(guildId).length === 0) this.markPendingLeave(guildId);
     })();
     this.truncateWal();
   }
