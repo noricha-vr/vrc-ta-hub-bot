@@ -433,3 +433,17 @@ test("a failed leave of the last guild is retried on the next ready and forgotte
   expect(f.store.pendingLeaves()).toEqual([]);
   expect(f.gateway.leftGuilds).toHaveLength(2);
 });
+
+test("setup is refused while a pending guild leave is being retried", async () => {
+  const f = fixture();
+  f.store.markPendingLeave("100");
+  let release!: () => void;
+  f.gateway.beforeLeave = () => new Promise<void>(resolve => { release = resolve; });
+  f.hub.guildsReady(["100"]);
+  const view = await f.interact("setup");
+  expect(view.content).toContain("退出処理中");
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(f.store.pendingLeaves()).toEqual([]);
+  expect(f.store.settings()).toEqual([]);
+});

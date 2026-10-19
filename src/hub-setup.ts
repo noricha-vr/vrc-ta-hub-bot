@@ -240,7 +240,11 @@ export class HubSetup {
     for (const guildId of this.store.pendingLeaves()) {
       if (!joined.has(guildId)) { this.store.clearPendingLeave(guildId); continue; }
       if (this.store.settings(guildId).length) { this.store.clearPendingLeave(guildId); continue; }
-      void this.leaveGuild(guildId).catch(() => this.log("hub_leave_retry_failed"));
+      // 退出し直す間は、対話の leave と同じく setup を受け付けない（退出後に新しい設定が残らないように）。
+      if (this.leaving.has(guildId)) continue;
+      this.leaving.add(guildId);
+      void this.leaveGuild(guildId).catch(() => this.log("hub_leave_retry_failed"))
+        .finally(() => { this.invalidate(guildId); this.leaving.delete(guildId); });
     }
     for (const guildId of new Set(this.store.settings().map(s => s.guildId))) {
       if (!joined.has(guildId)) this.guildDeleted(guildId);
