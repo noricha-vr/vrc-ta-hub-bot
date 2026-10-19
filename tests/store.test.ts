@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageStore } from "../src/store";
@@ -32,3 +32,26 @@ test("期限を過ぎた未処理の本文は purge で消え、カーソルは�
   expect(store.cursor("c1")).toBe("10");
   store.close();
 });
+
+function fileContains(path: string, needle: string): boolean {
+  return existsSync(path) && readFileSync(path).includes(Buffer.from(needle));
+}
+
+for (const how of ["ack", "purge"] as const) {
+  test(`${how} で消した本文は DB ファイルと WAL のバイト列に残らない`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "store-"));
+    dirs.push(dir);
+    const path = join(dir, "state.sqlite");
+    const store = new MessageStore(path);
+    const secret = "SYNTHETIC-BODY-7f3a9c";
+    // 頁をまたぐ長さにして、空きリストへ回るオーバーフロー頁も確かめる（FAST 既定では消えない）。
+    const longBody = `${secret}-gone `.repeat(1000);
+    store.save({ ...message("10"), content: longBody });
+    store.save(message("11"));
+    if (how === "ack") store.ack("c1", "10");
+    else store.purge(0, Math.floor(Date.now() / 1000) + 10);
+    expect(fileContains(path, `${secret}-gone`)).toBe(false);
+    expect(fileContains(`${path}-wal`, `${secret}-gone`)).toBe(false);
+    store.close();
+  });
+}

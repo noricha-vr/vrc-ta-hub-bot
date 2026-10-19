@@ -11,6 +11,7 @@ export class MessageStore {
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
       PRAGMA busy_timeout = 5000;
+      PRAGMA secure_delete = ON;
       CREATE TABLE IF NOT EXISTS channel_cursors (
         channel_id TEXT PRIMARY KEY,
         last_message_id TEXT NOT NULL
@@ -51,11 +52,19 @@ export class MessageStore {
   /** 受信箱は処理待ちの間だけ本文を持つ。処理が済んだら消す。 */
   ack(channelId: string, messageId: string): void {
     this.db.query("DELETE FROM inbox WHERE channel_id = ? AND message_id = ?").run(channelId, messageId);
+    this.truncateWal();
   }
 
   /** 処理されずに残った本文も、期限を過ぎたら消す。 */
   purge(maxAgeSeconds: number, nowSeconds = Math.floor(Date.now() / 1000)): number {
-    return this.db.query("DELETE FROM inbox WHERE received_at < ?").run(nowSeconds - maxAgeSeconds).changes;
+    const removed = this.db.query("DELETE FROM inbox WHERE received_at <= ?").run(nowSeconds - maxAgeSeconds).changes;
+    this.truncateWal();
+    return removed;
+  }
+
+  /** secure_delete で上書きした頁を本体へ戻し、本文の残る WAL を空にする。 */
+  private truncateWal(): void {
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   }
 
   messages(channelId: string): GatewayMessage[] {

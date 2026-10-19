@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Client, Events, GatewayIntentBits, IntentsBitField, PermissionFlagsBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, IntentsBitField, LimitedCollection, Message, MessageManager, PermissionFlagsBits } from "discord.js";
 import { clientOptions, DiscordGateway } from "../src/discord-gateway";
 import type { GatewayEvents, GatewayMessage } from "../src/gateway";
 
@@ -30,7 +30,6 @@ test("adapter maps full reconnect and resume events without logging in", async (
     expect(connected).toBe(0);
     // emit is used only to drive the local event emitter; login is never called.
     client.emit(Events.ClientReady, client as Client<true>);
-    client.emit(Events.ShardDisconnect, { code: 1000, reason: "test", wasClean: true }, 0);
     client.emit(Events.ShardReconnecting, 0);
     client.emit(Events.ShardResume, 0, 2);
     client.emit(Events.ShardReady, 0, undefined);
@@ -38,7 +37,7 @@ test("adapter maps full reconnect and resume events without logging in", async (
     client.emit(Events.ShardError, new Error("fake"), 0);
     client.emit(Events.Invalidated);
     expect({ connected, disconnected, reconnecting, errors, fatal }).toEqual({
-      connected: 3, disconnected: 1, reconnecting: 1, errors: 2, fatal: 1,
+      connected: 3, disconnected: 0, reconnecting: 1, errors: 2, fatal: 1,
     });
     expect(received).toEqual([]);
     unsubscribe();
@@ -65,4 +64,26 @@ test("adapter refuses missing history permission instead of returning a misleadi
     client.channels.fetch = original;
     await gateway.stop();
   }
+});
+
+test("a non-resumable shard disconnect is fatal so the supervisor restarts the process", async () => {
+  for (const code of [4004, 4010, 4011, 4012, 4013, 4014]) {
+    const client = new Client(clientOptions);
+    const gateway = new DiscordGateway(client);
+    let fatal = 0;
+    let disconnected = 0;
+    gateway.subscribe({
+      connected: () => {}, disconnected: () => { disconnected++; }, reconnecting: () => {},
+      message: () => {}, error: () => {}, fatal: () => { fatal++; },
+    });
+    client.emit(Events.ShardDisconnect, { code, reason: "test", wasClean: true } as never, 0);
+    expect({ code, fatal, disconnected }).toEqual({ code, fatal: 1, disconnected: 0 });
+    await gateway.stop();
+  }
+});
+
+test("message bodies are not kept in the SDK message cache", () => {
+  const cache = clientOptions.makeCache!(MessageManager as never, Message as never, MessageManager as never);
+  expect(cache).toBeInstanceOf(LimitedCollection);
+  expect((cache as LimitedCollection<string, unknown>).maxSize).toBe(0);
 });

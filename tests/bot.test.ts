@@ -120,6 +120,37 @@ describe("durable gateway ingestion", () => {
     expect(f.health().recoveredMessageCount).toBe(150);
   });
 
+  test("a live save failure during recovery keeps the channel pending until a later recovery saves it", async () => {
+    const f = fixture();
+    f.store.save(message(1), true);
+    f.gateway.history = [message(2)];
+    const save = f.store.save.bind(f.store);
+    f.store.save = (item, advance) => {
+      if (item.id === "3") throw new Error("disk full");
+      return save(item, advance);
+    };
+    let liveSent = false;
+    f.gateway.beforeFetch = async () => {
+      if (liveSent) return;
+      liveSent = true;
+      f.gateway.events!.message(message(3)); // fails to persist
+      f.gateway.events!.message(message(4));
+    };
+    await f.bot.start("fake");
+    await f.bot.reconcile();
+    expect(f.logs).toContain("message_store_failed");
+    expect(f.health().pendingChannelCount).toBe(1);
+    expect(f.store.cursor("10")).toBe("1");
+    f.gateway.events!.message(message(5)); // still pending: must not jump the cursor past 3
+    expect(f.store.cursor("10")).toBe("1");
+    f.store.save = save;
+    f.gateway.history = [message(2), message(3), message(4), message(5)];
+    await f.bot.reconcile();
+    expect(f.store.messages("10").map(item => item.id)).toEqual(["1", "2", "3", "4", "5"]);
+    expect(f.store.cursor("10")).toBe("5");
+    expect(f.health().pendingChannelCount).toBe(0);
+  });
+
   test("one failed channel does not prevent recovery of other selected channels", async () => {
     const f = fixture(["10", "11"]);
     f.gateway.history = [message(1), message(2, "11")];

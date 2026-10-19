@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { HubBot } from "./bot";
 import { loadConfig } from "./config";
@@ -6,12 +6,25 @@ import { DiscordGateway } from "./discord-gateway";
 import { acquireLock } from "./lock";
 import { MessageStore } from "./store";
 
-const INBOX_MAX_AGE_SECONDS = 86_400;
+// 1 時間ごとの削除の遅れを足しても 24 時間を超えないよう、期限は 23 時間にする。
+export const INBOX_MAX_AGE_SECONDS = 23 * 3600;
+export const INBOX_PURGE_INTERVAL_MS = 3_600_000;
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
 const log = (event: string) => console.error(JSON.stringify({ time: new Date().toISOString(), event }));
+
+/** mkdirSync の mode は既存のディレクトリに効かないので、起動ごとに権限をそろえる。 */
+export function restrictDataPermissions(dataDir: string, dbPath: string): void {
+  chmodSync(dataDir, DIR_MODE);
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    if (existsSync(path)) chmodSync(path, FILE_MODE);
+  }
+}
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
-  mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+  mkdirSync(config.dataDir, { recursive: true, mode: DIR_MODE });
+  chmodSync(config.dataDir, DIR_MODE);
   const release = acquireLock(join(config.dataDir, "bot.lock"));
   let store: MessageStore | undefined;
   let bot: HubBot | undefined;
@@ -30,11 +43,13 @@ async function main(): Promise<void> {
     void shutdown(false).then(() => process.exit(0), () => process.exit(1));
   };
   try {
-    store = new MessageStore(join(config.dataDir, "state.sqlite"));
+    const dbPath = join(config.dataDir, "state.sqlite");
+    store = new MessageStore(dbPath);
+    restrictDataPermissions(config.dataDir, dbPath);
     // 本文は処理待ちの間だけ持つ。取り残しも 1 日で消す。
     const opened = store;
     opened.purge(INBOX_MAX_AGE_SECONDS);
-    setInterval(() => { try { opened.purge(INBOX_MAX_AGE_SECONDS); } catch { log("inbox_purge_failed"); } }, 3_600_000).unref();
+    setInterval(() => { try { opened.purge(INBOX_MAX_AGE_SECONDS); } catch { log("inbox_purge_failed"); } }, INBOX_PURGE_INTERVAL_MS).unref();
     bot = new HubBot(new DiscordGateway(), store, {
       channelIds: config.channelIds,
       healthPath: join(config.dataDir, "health.json"),

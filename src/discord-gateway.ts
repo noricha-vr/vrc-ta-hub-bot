@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, PermissionFlagsBits, type ClientOptions, type Message } from "discord.js";
+import { Client, Events, GatewayIntentBits, Options, PermissionFlagsBits, type ClientOptions, type Message } from "discord.js";
 import type { Gateway, GatewayEvents, GatewayMessage, HistoryQuery } from "./gateway";
 
 export const clientOptions: ClientOptions = {
@@ -7,6 +7,8 @@ export const clientOptions: ClientOptions = {
   shards: [0],
   shardCount: 1,
   rest: { timeout: 15000, retries: 3 },
+  // 本文は受信箱にだけ持つ。SDK のメッセージキャッシュには残さない。
+  makeCache: Options.cacheWithLimits({ ...Options.DefaultMakeCacheSettings, MessageManager: 0 }),
 };
 
 function toMessage(message: Message): GatewayMessage {
@@ -28,7 +30,9 @@ export class DiscordGateway implements Gateway {
     const onReady = () => { ready = true; events.connected(); };
     const onShardReady = () => { if (ready) events.connected(); };
     const onResume = () => events.connected();
-    const onDisconnect = () => events.disconnected();
+    // discord.js 14 では ShardDisconnect は再接続しない close code（4004 / 4010〜4014 等）の時だけ出る。
+    // 同じクライアントでは復帰しないので、終了させて外の監督に再起動させる。
+    const onDisconnect = () => events.fatal();
     const onReconnecting = () => events.reconnecting();
     const onMessage = (message: Message) => { if (message.inGuild()) events.message(toMessage(message)); };
     const onError = () => events.error();

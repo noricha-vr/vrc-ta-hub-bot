@@ -15,6 +15,8 @@ interface BotOptions {
 export class HubBot {
   private readonly selected: Set<string>;
   private readonly pending: Set<string>;
+  /** チャンネルごとの保存失敗の世代。取り直し中に増えたら、その取り直しでは完了にしない。 */
+  private readonly failures = new Map<string, number>();
   private readonly now: () => Date;
   private readonly health: Health;
   private connected = false;
@@ -93,6 +95,7 @@ export class HubBot {
       this.store.save(message, this.connected && !this.pending.has(message.channelId));
     } catch {
       this.pending.add(message.channelId);
+      this.failures.set(message.channelId, this.failureGeneration(message.channelId) + 1);
       this.recordError("message_store_failed");
     }
     this.publish();
@@ -129,7 +132,12 @@ export class HubBot {
     this.publish();
   }
 
+  private failureGeneration(channelId: string): number {
+    return this.failures.get(channelId) ?? 0;
+  }
+
   private async recoverChannel(channelId: string, epoch: number): Promise<void> {
+    const failuresAtStart = this.failureGeneration(channelId);
     const baseline = this.store.cursor(channelId);
     let highWater = baseline;
     let before: string | undefined;
@@ -161,6 +169,9 @@ export class HubBot {
       before = oldest;
     }
     if (!this.current(epoch)) return;
+    // A live save failed while scanning; that message may be newer than our scan.
+    // Keep the channel pending so the next reconcile re-reads it.
+    if (this.failureGeneration(channelId) !== failuresAtStart) return;
     // Commit only after the entire gap has been durably saved. Partial scans and
     // live events during recovery cannot acknowledge unseen older messages.
     this.store.advance(channelId, highWater);
