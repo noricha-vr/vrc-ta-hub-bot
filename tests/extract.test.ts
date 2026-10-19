@@ -444,3 +444,64 @@ test("応募の再試行中に届いた続報は保留し、応募の後に処�
   expect(f.store.get(draft.id)?.materials).toContainEqual({ kind: "pdf", url: "https://example.invalid/extra.pdf" });
   expect(f.inbox.messages("10")).toEqual([]);
 });
+
+test("ラベルの後に別の文が続く題名は採らず、ラベルと題名だけの行は採る", async () => {
+  expect(extractTitle("題名: 型の話。PRIVATE-NOTE の件は後で連絡します")).toBeUndefined();
+  expect(extractTitle("題名: 型の話、あと懇親会は欠席です")).toBeUndefined();
+  expect(extractTitle("題名: 型の話")).toBe("型の話");
+  expect(extractTitle("題名: 型の話。")).toBe("型の話");
+  const f = fixture();
+  f.judge.answer("application"); f.judge.answer("line_2");
+  expect(await f.extractor.extract("meeting-1", post("100", "10/23 に応募\n題名: 型の話。PRIVATE-NOTE の件は後で連絡します")))
+    .toMatchObject({ status: "review", reason: "title_unextracted" });
+});
+
+for (const [answer, confidence] of [["none", 1], ["low", 0.5]] as const) {
+  test(`下書きがあっても対象が決まらない続報（${answer}）は、別の応募が再試行待ちなら保留する`, async () => {
+    const f = retryFixture(); const now = 1_800_000_000;
+    f.judge.answer("application"); f.judge.answer("line_2");
+    const first = await f.extractor.extract("meeting-1", post());
+    if (first.status !== "candidate") throw new Error("Expected candidate");
+    const later = post("101", "11/6 に応募\n「別の題名」"); f.inbox.save(later);
+    f.judge.replies.push(new Error("down"));
+    expect((await processInboxMessage(f.extractor, f.inbox, "meeting-1", later, now)).status).toBe("retry");
+    const update = post("102", "11/6 の資料です"); f.inbox.save(update);
+    f.judge.answer("follow_up"); f.judge.answer(answer === "low" ? first.draft.id : "none", confidence);
+    expect(await processInboxMessage(f.extractor, f.inbox, "meeting-1", update, now))
+      .toMatchObject({ status: "retry", reason: "awaiting_application" });
+    expect(f.store.pending(update.id)).toMatchObject({ state: "retry" });
+    expect(f.inbox.messages("10").map(item => item.id)).toEqual(["101", "102"]);
+  });
+}
+
+test("回数切れと取り直せない投稿は、確認の記録を残した後に本文を ack し、集計も review にする", async () => {
+  const f = retryFixture(); const now = 1_800_000_000;
+  const item = post("100"); f.inbox.save(item);
+  for (let i = 0; i < MAX_RETRY_ATTEMPTS; i++) {
+    f.judge.replies.push(new Error("down"));
+    await processInboxMessage(f.extractor, f.inbox, "meeting-1", item, now);
+  }
+  expect(f.store.pending(item.id)).toMatchObject({ state: "review", reason: "retry_exhausted" });
+  expect(f.inbox.messages("10")).toEqual([]);
+  expect(f.extractor.counts()).toMatchObject({ retry: MAX_RETRY_ATTEMPTS - 1, review: 1 });
+
+  const gone = post("101"); f.inbox.save(gone);
+  f.judge.replies.push(new Error("down"));
+  await processInboxMessage(f.extractor, f.inbox, "meeting-1", gone, now);
+  expect((await processDueRetries(f.extractor, f.inbox, f.gateway, now + 300))[0]).toMatchObject({ reason: "refetch_failed" });
+  expect(f.store.pending(gone.id)).toMatchObject({ state: "review" });
+  expect(f.inbox.messages("10")).toEqual([]);
+});
+
+test("取り直しの一時的な障害は回数の内で再試行し、投稿が無い時だけ確認対象にする", async () => {
+  const f = retryFixture(); const now = 1_800_000_000;
+  const item = post("100"); f.gateway.history = [item];
+  f.judge.replies.push(new Error("down"));
+  await processInboxMessage(f.extractor, f.inbox, "meeting-1", item, now);
+  f.gateway.beforeFetch = async () => { throw Object.assign(new Error("Service Unavailable"), { status: 503 }); };
+  expect(await processDueRetries(f.extractor, f.inbox, f.gateway, now + 300))
+    .toEqual([{ status: "retry", reason: "refetch_unavailable", source: f.store.pending(item.id)!.source }]);
+  expect(f.store.pending(item.id)).toMatchObject({ state: "retry", attempts: 2 });
+  f.gateway.beforeFetch = async () => { throw Object.assign(new Error("Unknown Message"), { code: 10008, status: 404 }); };
+  expect((await processDueRetries(f.extractor, f.inbox, f.gateway, now + 10_000))[0]).toMatchObject({ status: "review", reason: "refetch_failed" });
+});

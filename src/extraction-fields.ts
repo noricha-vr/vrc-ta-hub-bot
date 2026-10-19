@@ -49,7 +49,8 @@ export function extractTitle(line: string): string | undefined {
   const labelled = TITLE_LABEL.exec(line)?.[1]?.trim();
   const source = labelled ?? line;
   const quoted = TITLE_QUOTES.map(pattern => pattern.exec(source)?.[1]?.trim()).find(Boolean);
-  const title = quoted ?? labelled;
+  // ラベルの後は、題名で行が終わると確定できる時だけ採る（句読点の後に別の文が続くなら採らない）。
+  const title = quoted ?? (labelled && !/[。、，,．!！?？]/.test(labelled.replace(/[。．.]$/, "")) ? labelled.replace(/[。．]$/, "") : undefined);
   if (!title || [...title].length > MAX_TITLE_LENGTH || /https?:\/\/|<@|@everyone|@here/i.test(title)) return undefined;
   return title;
 }

@@ -8,7 +8,7 @@ export type MeetingDates = (meetingId: string) => readonly string[] | Promise<re
 export type ReviewReason = "uncertain" | "no_choice" | "missing_metadata" | "too_many_choices"
   | "date_missing" | "date_ambiguous" | "date_unmatched" | "date_conflict" | "title_unextracted"
   | "refetch_failed" | "retry_exhausted";
-export type RetryReason = "judge_unavailable" | "dates_unavailable" | "store_unavailable" | "awaiting_application";
+export type RetryReason = "judge_unavailable" | "dates_unavailable" | "store_unavailable" | "awaiting_application" | "refetch_unavailable";
 export type ExtractionResult = SavedDraft
   | { status: "unrelated"; source: PostReference }
   | { status: "review"; reason: ReviewReason; question: "これは応募ですか"; source: PostReference }
@@ -65,6 +65,11 @@ export class PostExtractor {
   /** 呼び出し側で決めた結果（取り直し失敗など）も同じ分類で数える。 */
   count(result: ExtractionResult): void { this.totals[result.status]++; }
 
+  /** 呼び出し側で結果を変えた時（回数切れで retry → review）に集計を合わせる。 */
+  recount(from: ExtractionResult["status"], to: ExtractionResult["status"]): void {
+    this.totals[from]--; this.totals[to]++;
+  }
+
   private async choose(content: string, name: string, question: ChoiceQuestion): Promise<ChoiceAnswer> {
     const answers = await this.judge.ask({ state: content, questions: { [name]: question } });
     const answer = answers[name];
@@ -104,11 +109,11 @@ export class PostExtractor {
   ): Promise<ExtractionResult> {
     // 対象を投稿者の同じ集会の下書きに限定。API に渡す既存情報は ID・開催日・題名だけ。
     const drafts = this.store.forPresenter(meetingId, message.authorId);
-    if (drafts.length === 0) {
-      // 応募が再試行待ちなら、続報も消さずに後で処理し直す。
-      return this.store.hasPendingFrom(meetingId, message.authorId, message.id)
-        ? { status: "retry", reason: "awaiting_application", source } : review("no_choice");
-    }
+    // 対象が決まらない時、同じ発表者の応募が再試行待ちなら続報も消さずに後で処理し直す。
+    const waitOr = (held: ExtractionResult): ExtractionResult =>
+      this.store.hasPendingFrom(meetingId, message.authorId, message.id)
+        ? { status: "retry", reason: "awaiting_application", source } : held;
+    if (drafts.length === 0) return waitOr(review("no_choice"));
     if (drafts.length > MAX_CHOICES) return review("too_many_choices");
     const criteria: Record<string, string> = Object.fromEntries(drafts.map(draft => [draft.id, draftLabel(draft)]));
     criteria.none = "No matching draft";
@@ -118,7 +123,7 @@ export class PostExtractor {
     });
     if (!selected) return { status: "retry", reason: "judge_unavailable", source };
     const held = check(selected, review);
-    if (held) return held;
+    if (held) return waitOr(held);
     const draft = drafts.find(item => item.id === selected.answer)!;
     // 日付のない資料の追記は可能。別日付への変更は自動で行わない。
     const undated = resolveEventDate(message.content, [], message.createdAt);
@@ -179,14 +184,34 @@ export const retryDelaySeconds = (attempts: number): number =>
 
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
+type Inbox = Pick<MessageStore, "ack">;
+const reviewOf = (reason: ReviewReason, source: PostReference): ExtractionResult =>
+  ({ status: "review", reason, question: "これは応募ですか", source });
+
+/** 確認対象の記録を残してから受信箱の本文を消す。 */
+function holdForReview(store: ExtractionStore, inbox: Inbox, source: PostReference, reason: ReviewReason): ExtractionResult {
+  store.markReview(source.messageId, reason);
+  inbox.ack(source.channelId, source.messageId);
+  return reviewOf(reason, source);
+}
+
 /**
- * 結果を記録する。retry は本文を持たない記録（ID・出典・回数・次の時刻）を残し、受信箱の本文は延長しない。
- * 回数切れは確認対象として記録を残す。retry 以外は記録を消して本文を ack する。
+ * retry は本文を持たない記録（ID・出典・回数・次の時刻）を残し、受信箱の本文は延長しない。
+ * 回数切れは確認対象の記録を残して本文を ack する。記録できない時は本文を残す。
  */
-async function settle(
-  extractor: PostExtractor, inbox: Pick<MessageStore, "ack">, meetingId: string, message: GatewayMessage,
+function recordRetry(
+  store: ExtractionStore, inbox: Inbox, meetingId: string, authorId: string,
+  source: PostReference, reason: string, now: number,
+): "retry" | ExtractionResult {
+  const attempts = store.scheduleRetry(meetingId, authorId, source, reason, retryDelaySeconds, now);
+  return attempts < MAX_RETRY_ATTEMPTS ? "retry" : holdForReview(store, inbox, source, "retry_exhausted");
+}
+
+/** retry 以外は記録を消して本文を ack する。 */
+function settle(
+  extractor: PostExtractor, inbox: Inbox, meetingId: string, message: GatewayMessage,
   result: ExtractionResult, now: number,
-): Promise<ExtractionResult> {
+): ExtractionResult {
   const store = extractor.store;
   if (result.status !== "retry") {
     store.clearPending(message.id);
@@ -194,10 +219,10 @@ async function settle(
     return result;
   }
   try {
-    const attempts = store.scheduleRetry(meetingId, message.authorId, result.source, result.reason, retryDelaySeconds, now);
-    if (attempts < MAX_RETRY_ATTEMPTS) return result;
-    store.markReview(message.id, "retry_exhausted");
-    return { status: "review", reason: "retry_exhausted", question: "これは応募ですか", source: result.source };
+    const recorded = recordRetry(store, inbox, meetingId, message.authorId, result.source, result.reason, now);
+    if (recorded === "retry") return result;
+    extractor.recount("retry", recorded.status);
+    return recorded;
   } catch {
     // 記録できない時は本文を消さず、受信箱から再処理できる状態に留める。
     return result;
@@ -206,37 +231,57 @@ async function settle(
 
 /** 保存完了後だけ ack。retry は永続化した記録から processDueRetries で取り直して再処理する。 */
 export async function processInboxMessage(
-  extractor: PostExtractor, inbox: Pick<MessageStore, "ack">, meetingId: string, message: GatewayMessage,
+  extractor: PostExtractor, inbox: Inbox, meetingId: string, message: GatewayMessage,
   now = nowSeconds(),
 ): Promise<ExtractionResult> {
   return settle(extractor, inbox, meetingId, message, await extractor.extract(meetingId, message), now);
 }
 
-/** Gateway から 1 件だけ取り直す。見つからなければ undefined。 */
-async function refetch(gateway: Pick<Gateway, "fetchMessages">, pending: PendingPost): Promise<GatewayMessage | undefined> {
+const MISSING_CODES = new Set([10003, 10008]); // Unknown Channel / Unknown Message
+
+/** 投稿が無い（404・Unknown Message）か。それ以外の失敗（5xx・タイムアウト等）は一時的な障害とみなす。 */
+function isMissing(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { code, status } = error as { code?: unknown; status?: unknown };
+  return status === 404 || (typeof code === "number" && MISSING_CODES.has(code));
+}
+
+type Refetched = { kind: "found"; message: GatewayMessage } | { kind: "missing" } | { kind: "unavailable" };
+
+/** Gateway から 1 件だけ取り直す。 */
+async function refetch(gateway: Pick<Gateway, "fetchMessages">, pending: PendingPost): Promise<Refetched> {
   const { channelId, messageId } = pending.source;
   try {
     const page = await gateway.fetchMessages(channelId, { around: messageId, limit: 1 });
-    return page.find(item => item.id === messageId && item.channelId === channelId);
-  } catch { return undefined; }
+    const message = page.find(item => item.id === messageId && item.channelId === channelId);
+    return message ? { kind: "found", message } : { kind: "missing" };
+  } catch (error) {
+    return isMissing(error) ? { kind: "missing" } : { kind: "unavailable" };
+  }
+}
+
+/** 取り直せなかった投稿の扱い。一時的な障害は回数の内で再試行し、投稿が無ければ確認対象にする。 */
+function unrefetched(store: ExtractionStore, inbox: Inbox, pending: PendingPost, kind: "missing" | "unavailable", now: number): ExtractionResult {
+  if (kind === "missing") return holdForReview(store, inbox, pending.source, "refetch_failed");
+  const recorded = recordRetry(store, inbox, pending.meetingId, pending.authorId, pending.source, "refetch_unavailable", now);
+  return recorded === "retry" ? { status: "retry", reason: "refetch_unavailable", source: pending.source } : recorded;
 }
 
 /** 期限の来た再試行を、受信箱の本文に頼らず Gateway から取り直して処理し直す。 */
 export async function processDueRetries(
-  extractor: PostExtractor, inbox: Pick<MessageStore, "ack">, gateway: Pick<Gateway, "fetchMessages">,
+  extractor: PostExtractor, inbox: Inbox, gateway: Pick<Gateway, "fetchMessages">,
   now = nowSeconds(),
 ): Promise<ExtractionResult[]> {
   const results: ExtractionResult[] = [];
   for (const pending of extractor.store.dueRetries(now)) {
-    const message = await refetch(gateway, pending);
-    if (!message) {
-      extractor.store.markReview(pending.source.messageId, "refetch_failed");
-      const result: ExtractionResult = { status: "review", reason: "refetch_failed", question: "これは応募ですか", source: pending.source };
-      extractor.count(result);
-      results.push(result);
+    const fetched = await refetch(gateway, pending);
+    if (fetched.kind === "found") {
+      results.push(await processInboxMessage(extractor, inbox, pending.meetingId, fetched.message, now));
       continue;
     }
-    results.push(await processInboxMessage(extractor, inbox, pending.meetingId, message, now));
+    const result = unrefetched(extractor.store, inbox, pending, fetched.kind, now);
+    extractor.count(result);
+    results.push(result);
   }
   return results;
 }
