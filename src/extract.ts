@@ -207,15 +207,18 @@ function recordRetry(
   return attempts < MAX_RETRY_ATTEMPTS ? "retry" : holdForReview(store, inbox, source, "retry_exhausted");
 }
 
-/** retry 以外は記録を消して本文を ack する。 */
+/**
+ * retry 以外は本文を ack してから記録を消す。ack に失敗しても記録が残り、次の回で取り直せる。
+ * 記録を消す前に落ちても、同じ投稿の再処理は duplicate として扱われる。
+ */
 function settle(
   extractor: PostExtractor, inbox: Inbox, meetingId: string, message: GatewayMessage,
   result: ExtractionResult, now: number,
 ): ExtractionResult {
   const store = extractor.store;
   if (result.status !== "retry") {
-    store.clearPending(message.id);
     inbox.ack(message.channelId, message.id);
+    store.clearPending(message.id);
     return result;
   }
   try {

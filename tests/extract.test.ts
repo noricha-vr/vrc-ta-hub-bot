@@ -404,6 +404,21 @@ test("retry は本文なしの記録を残し、purge の後も Gateway から�
   }
 });
 
+test("再試行の後で ack に失敗しても、記録が残って次の回で取り直せる", async () => {
+  const f = retryFixture(); const item = post(); f.gateway.history = [item]; const now = 1_800_000_000;
+  f.judge.replies.push(new Error("down"));
+  await processInboxMessage(f.extractor, f.inbox, "meeting-1", item, now);
+  const ack = f.inbox.ack.bind(f.inbox);
+  f.inbox.ack = () => { throw new Error("disk"); };
+  f.judge.answer("application"); f.judge.answer("line_2");
+  expect(await processDueRetries(f.extractor, f.inbox, f.gateway, now + 300)).toMatchObject([{ status: "retry" }]);
+  expect(f.store.pending(item.id)).toMatchObject({ state: "retry" });
+  f.inbox.ack = ack;
+  const [again] = await processDueRetries(f.extractor, f.inbox, f.gateway, now + 300);
+  expect(again).toMatchObject({ draft: { title: "型の話" } });
+  expect(f.store.pending(item.id)).toBeUndefined();
+});
+
 test("取り直せない投稿と回数切れの投稿は記録を残して確認対象にする", async () => {
   const f = retryFixture(); const item = post(); const now = 1_800_000_000;
   f.judge.replies.push(new Error("down"));
