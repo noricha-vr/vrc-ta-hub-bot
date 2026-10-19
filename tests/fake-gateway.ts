@@ -27,6 +27,7 @@ export class FakeGateway implements Gateway {
   async fetchMessages(channelId: string, query: HistoryQuery): Promise<GatewayMessage[]> {
     this.queries.push({ channelId, query });
     await this.beforeFetch?.(channelId, query);
+    if (query.around !== undefined) return this.history.filter(item => item.channelId === channelId && item.id === query.around);
     return this.history.filter(item => item.channelId === channelId
       && (query.after === undefined || compareIds(item.id, query.after) > 0)
       && (query.before === undefined || compareIds(item.id, query.before) < 0))

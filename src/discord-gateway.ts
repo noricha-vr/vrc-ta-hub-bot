@@ -15,6 +15,12 @@ function toMessage(message: Message): GatewayMessage {
   return {
     id: message.id, channelId: message.channelId, authorId: message.author.id,
     content: message.content, createdAt: message.createdAt.toISOString(),
+    authorDisplayName: message.member?.displayName ?? message.author.displayName,
+    sourceUrl: message.url,
+    attachments: [...message.attachments.values()].map(attachment => ({
+      url: attachment.url, name: attachment.name,
+      ...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+    })),
   };
 }
 

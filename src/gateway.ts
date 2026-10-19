@@ -1,14 +1,25 @@
+export interface GatewayAttachment {
+  url: string;
+  name: string;
+  contentType?: string;
+}
+
 export interface GatewayMessage {
   id: string;
   channelId: string;
   authorId: string;
   content: string;
   createdAt: string;
+  authorDisplayName?: string;
+  sourceUrl?: string;
+  attachments?: GatewayAttachment[];
 }
 
 export interface HistoryQuery {
   after?: string;
   before?: string;
+  /** 指定 ID の前後を取る（再試行で 1 件を取り直す時に使う）。after / before と併用しない。 */
+  around?: string;
   limit: number;
 }
 
