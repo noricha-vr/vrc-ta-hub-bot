@@ -1,9 +1,18 @@
+export interface GatewayAttachment {
+  url: string;
+  name: string;
+  contentType?: string;
+}
+
 export interface GatewayMessage {
   id: string;
   channelId: string;
   authorId: string;
   content: string;
   createdAt: string;
+  authorDisplayName?: string;
+  sourceUrl?: string;
+  attachments?: GatewayAttachment[];
 }
 
 export interface HistoryQuery {

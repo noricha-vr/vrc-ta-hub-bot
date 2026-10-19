@@ -87,3 +87,39 @@ test("message bodies are not kept in the SDK message cache", () => {
   expect(cache).toBeInstanceOf(LimitedCollection);
   expect((cache as LimitedCollection<string, unknown>).maxSize).toBe(0);
 });
+
+test("投稿の表示名・リンク・添付を新着と履歴で同じ形式に写す", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  const received: GatewayMessage[] = [];
+  gateway.subscribe({
+    connected: () => {}, disconnected: () => {}, reconnecting: () => {},
+    message: item => received.push(item), error: () => {}, fatal: () => {},
+  });
+  const sdkMessage = {
+    id: "100", channelId: "10", author: { id: "20", displayName: "アカウント表示名" },
+    member: { displayName: "集会での表示名" }, content: "応募します", createdAt: new Date("2026-10-19T00:00:00Z"),
+    url: "https://example.invalid/posts/100", inGuild: () => true,
+    attachments: new Map([["a1", { name: "slides.pdf", url: "https://example.invalid/slides.pdf", contentType: "application/pdf" }]]),
+  } as unknown as Message<true>;
+  const original = client.channels.fetch;
+  client.channels.fetch = (async () => ({
+    isDMBased: () => false, isTextBased: () => true,
+    guild: { members: { me: { id: "20" } } }, permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => new Map([["100", sdkMessage]]) },
+  })) as unknown as typeof client.channels.fetch;
+  try {
+    client.emit(Events.MessageCreate, sdkMessage);
+    const history = await gateway.fetchMessages("10", { limit: 100 });
+    expect(received).toEqual(history);
+    expect(received[0]).toMatchObject({
+      authorDisplayName: "集会での表示名", sourceUrl: sdkMessage.url,
+      attachments: [{ name: "slides.pdf", url: "https://example.invalid/slides.pdf", contentType: "application/pdf" }],
+    });
+    client.emit(Events.MessageCreate, { ...sdkMessage, member: null, attachments: new Map() } as unknown as Message<true>);
+    expect(received[1]?.authorDisplayName).toBe("アカウント表示名");
+  } finally {
+    client.channels.fetch = original;
+    await gateway.stop();
+  }
+});
