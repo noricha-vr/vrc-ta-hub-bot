@@ -41,17 +41,27 @@ export function mergeMaterials(...groups: readonly Material[][]): Material[] {
 }
 
 export const MAX_TITLE_LENGTH = 80;
-const TITLE_LABEL = /(?:題名|タイトル|演題|title)\s*[:：]\s*(.+)$/i;
-const TITLE_QUOTES = [/「([^「」]+)」/, /『([^『』]+)』/, /“([^“”]+)”/, /"([^"]+)"/];
+const QUOTED = /^(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』|"([^「」『』"“”]+)"|“([^「」『』"“”]+)”)$/;
+const LABELLED = /^(?:題名|タイトル|演題|title)(?:\s*[:：]\s*|\s+)(.+)$/i;
+const PLAIN_FORBIDDEN = /[。．.!?！？「」『』"“”]/;
+const UNSAFE = /https?:\/\/|<@|@everyone|@here/i;
 
-/** 選ばれた行から題名の部分だけを切り出す。切り出せない・長すぎる時は undefined（行全体は使わない）。 */
+const quotedTitle = (text: string): string | undefined => {
+  const match = QUOTED.exec(text);
+  return match?.slice(1).find(group => group !== undefined)?.trim();
+};
+
+/**
+ * 選ばれた行から題名だけを切り出す。許すのは行全体が次のどれかに一致する時だけで、それ以外は undefined（review）。
+ * (a)「X」『X』"X"“X” (b) ラベル＋区切り＋X（X に句点・終止符・引用符なし） (c) ラベル＋区切り＋引用。
+ * 判定の前に前後の空白と末尾の「。」1 つだけを除く。
+ */
 export function extractTitle(line: string): string | undefined {
-  const labelled = TITLE_LABEL.exec(line)?.[1]?.trim();
-  const source = labelled ?? line;
-  const quoted = TITLE_QUOTES.map(pattern => pattern.exec(source)?.[1]?.trim()).find(Boolean);
-  // ラベルの後は、題名で行が終わると確定できる時だけ採る（句読点の後に別の文が続くなら採らない）。
-  const title = quoted ?? (labelled && !/[。、，,．!！?？]/.test(labelled.replace(/[。．.]$/, "")) ? labelled.replace(/[。．]$/, "") : undefined);
-  if (!title || [...title].length > MAX_TITLE_LENGTH || /https?:\/\/|<@|@everyone|@here/i.test(title)) return undefined;
+  const text = line.trim().replace(/。$/, "").trim();
+  const label = LABELLED.exec(text)?.[1]?.trim();
+  const title = quotedTitle(text)
+    ?? (label === undefined ? undefined : quotedTitle(label) ?? (PLAIN_FORBIDDEN.test(label) ? undefined : label));
+  if (!title || [...title].length > MAX_TITLE_LENGTH || UNSAFE.test(title)) return undefined;
   return title;
 }
 

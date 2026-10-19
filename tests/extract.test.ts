@@ -304,14 +304,15 @@ test("日付は日本時間・年越し・次回・明示年を考慮し、URL �
   expect(resolveEventDate("2/30", ["2027-02-30"], createdAt)).toEqual({ status: "unresolved", reason: "unmatched" });
 });
 
-test("題名は括弧・ラベルの中だけを切り出し、1 行の投稿でも本文の残りを保存しない", async () => {
+test("1 行の投稿で引用が行の途中にある時は題名にせず、本文の残りを保存しない", async () => {
   const f = fixture();
   const marker = "PRIVATE-NOTE-7c1d";
   const item = post("100", `10/23 に応募します。題名は「型の話」です。${marker} の件は後で連絡します`);
   f.judge.answer("application"); f.judge.answer("line_1");
   const result = await f.extractor.extract("meeting-1", item);
-  expect(result).toMatchObject({ status: "candidate", draft: { title: "型の話" } });
+  expect(result).toMatchObject({ status: "review", reason: "title_unextracted" });
   expect(JSON.stringify(result)).not.toContain(marker);
+  expect(f.store.counts().drafts).toBe(0);
 });
 
 for (const [content, label] of [
@@ -327,7 +328,7 @@ for (const [content, label] of [
 }
 
 test("題名の切り出し規則", () => {
-  for (const [line, title] of [["題名: 型の話", "型の話"], ["タイトル：『型と私』", "型と私"], ["発表「A」をします", "A"],
+  for (const [line, title] of [["題名: 型の話", "型の話"], ["タイトル：『型と私』", "型と私"], ["発表「A」をします", undefined],
     ["Title: \"Types\"", "Types"], ["演題: 型の話 https://example.invalid/x", undefined], ["題名: <@123>", undefined],
     ["型の話", undefined], ["題名:", undefined], [`「${"a".repeat(80)}」`, "a".repeat(80)], [`「${"a".repeat(81)}」`, undefined]] as const) {
     expect(extractTitle(line)).toBe(title);
@@ -447,7 +448,11 @@ test("応募の再試行中に届いた続報は保留し、応募の後に処�
 
 test("ラベルの後に別の文が続く題名は採らず、ラベルと題名だけの行は採る", async () => {
   expect(extractTitle("題名: 型の話。PRIVATE-NOTE の件は後で連絡します")).toBeUndefined();
-  expect(extractTitle("題名: 型の話、あと懇親会は欠席です")).toBeUndefined();
+  expect(extractTitle("題名: 型の話。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
+  expect(extractTitle("Title: Types. PRIVATE-NOTE please contact me later")).toBeUndefined();
+  expect(extractTitle("I will talk. Title: Types")).toBeUndefined();
+  expect(extractTitle("10/23 に「型の話」で応募します")).toBeUndefined();
+  for (const line of ["題名：「型の話」", "「型の話」", " 『型の話』。 ", "題名 型の話", "演題: \"型の話\""]) expect(extractTitle(line)).toBe("型の話");
   expect(extractTitle("題名: 型の話")).toBe("型の話");
   expect(extractTitle("題名: 型の話。")).toBe("型の話");
   const f = fixture();
@@ -504,4 +509,36 @@ test("取り直しの一時的な障害は回数の内で再試行し、投稿�
   expect(f.store.pending(item.id)).toMatchObject({ state: "retry", attempts: 2 });
   f.gateway.beforeFetch = async () => { throw Object.assign(new Error("Unknown Message"), { code: 10008, status: 404 }); };
   expect((await processDueRetries(f.extractor, f.inbox, f.gateway, now + 10_000))[0]).toMatchObject({ status: "review", reason: "refetch_failed" });
+});
+
+test("再試行待ちの応募がある時、日付が既存の下書きと合わない続報も保留する", async () => {
+  const f = retryFixture(); const now = 1_800_000_000;
+  f.judge.answer("application"); f.judge.answer("line_2");
+  const first = await f.extractor.extract("meeting-1", post());
+  if (first.status !== "candidate") throw new Error("Expected candidate");
+  const later = post("101", "11/6 に応募\n「別の題名」");
+  f.judge.replies.push(new Error("down"));
+  await processInboxMessage(f.extractor, f.inbox, "meeting-1", later, now);
+  const update = post("102", "11/6 の資料です"); f.inbox.save(update);
+  f.judge.answer("follow_up"); f.judge.answer(first.draft.id);
+  expect(await processInboxMessage(f.extractor, f.inbox, "meeting-1", update, now))
+    .toMatchObject({ status: "retry", reason: "awaiting_application" });
+  expect(f.store.pending(update.id)).toMatchObject({ state: "retry" });
+  expect(f.inbox.messages("10").map(item => item.id)).toEqual(["102"]);
+  expect(f.store.get(first.draft.id)).toEqual(first.draft);
+});
+
+test("再試行の一括処理は 1 件の例外で止めず、次の投稿へ進む", async () => {
+  const f = retryFixture(); const now = 1_800_000_000;
+  const [a, b] = [post("100"), { ...post("101"), authorId: "21" }];
+  f.gateway.history = [a, b];
+  for (const item of [a, b]) { f.judge.replies.push(new Error("down")); await processInboxMessage(f.extractor, f.inbox, "meeting-1", item, now); }
+  f.judge.answer("application"); f.judge.answer("line_2"); f.judge.answer("application"); f.judge.answer("line_2");
+  // 1 件目は保存の後の ack で例外が外へ出る。
+  const ack = f.inbox.ack.bind(f.inbox);
+  f.inbox.ack = (channelId, id) => { if (id === a.id) throw new Error("locked"); ack(channelId, id); };
+  const results = await processDueRetries(f.extractor, f.inbox, f.gateway, now + 300);
+  expect(results).toMatchObject([{ status: "retry", reason: "store_unavailable" }, { status: "candidate" }]);
+  expect(f.store.pending(b.id)).toBeUndefined();
+  expect(f.store.forPresenter("meeting-1", "21")).toHaveLength(1);
 });

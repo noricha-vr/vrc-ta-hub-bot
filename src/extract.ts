@@ -132,7 +132,7 @@ export class PostExtractor {
       if (!dates) return { status: "retry", reason: "dates_unavailable", source };
       // 続報は開催後の資料共有もあるので、過去の開催日とも照合する。
       const date = resolveEventDate(message.content, dates, message.createdAt, { includePast: true });
-      if (date.status !== "resolved" || date.date !== draft.eventDate) return review("date_conflict");
+      if (date.status !== "resolved" || date.date !== draft.eventDate) return waitOr(review("date_conflict"));
     }
     return this.store.addFollowUp(draft.id, materials, source);
   }
@@ -274,14 +274,22 @@ export async function processDueRetries(
 ): Promise<ExtractionResult[]> {
   const results: ExtractionResult[] = [];
   for (const pending of extractor.store.dueRetries(now)) {
-    const fetched = await refetch(gateway, pending);
-    if (fetched.kind === "found") {
-      results.push(await processInboxMessage(extractor, inbox, pending.meetingId, fetched.message, now));
-      continue;
+    try {
+      results.push(await retryOne(extractor, inbox, gateway, pending, now));
+    } catch {
+      // 1 件の失敗でバッチを止めない。記録は残っているので次の回で再び拾う。
+      results.push({ status: "retry", reason: "store_unavailable", source: pending.source });
     }
-    const result = unrefetched(extractor.store, inbox, pending, fetched.kind, now);
-    extractor.count(result);
-    results.push(result);
   }
   return results;
+}
+
+async function retryOne(
+  extractor: PostExtractor, inbox: Inbox, gateway: Pick<Gateway, "fetchMessages">, pending: PendingPost, now: number,
+): Promise<ExtractionResult> {
+  const fetched = await refetch(gateway, pending);
+  if (fetched.kind === "found") return processInboxMessage(extractor, inbox, pending.meetingId, fetched.message, now);
+  const result = unrefetched(extractor.store, inbox, pending, fetched.kind, now);
+  extractor.count(result);
+  return result;
 }
