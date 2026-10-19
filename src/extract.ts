@@ -208,7 +208,7 @@ function recordRetry(
 }
 
 /**
- * retry 以外は本文を ack してから記録を消す。ack に失敗しても記録が残り、次の回で取り直せる。
+ * review は記録を残してから本文を ack する。それ以外（retry を除く）は本文を ack してから記録を消す。ack に失敗しても記録が残り、次の回で取り直せる。
  * 記録を消す前に落ちても、同じ投稿の再処理は duplicate として扱われる。
  */
 function settle(
@@ -216,6 +216,11 @@ function settle(
   result: ExtractionResult, now: number,
 ): ExtractionResult {
   const store = extractor.store;
+  if (result.status === "review") {
+    store.holdReview(meetingId, message.authorId, result.source, result.reason, now);
+    inbox.ack(message.channelId, message.id);
+    return result;
+  }
   if (result.status !== "retry") {
     inbox.ack(message.channelId, message.id);
     store.clearPending(message.id);

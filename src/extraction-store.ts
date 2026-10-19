@@ -187,6 +187,15 @@ export class ExtractionStore {
   }
 
   /** 取り直せない・回数切れの投稿は消さず、確認対象として残す。 */
+  /** 確認対象を本文なしで残す。新しい投稿でも、受信箱から消す前に記録しておく。 */
+  holdReview(meetingId: string, authorId: string, source: PostReference, reason: string, nowSeconds: number): void {
+    this.db.query(`INSERT INTO pending_posts
+      (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'review')
+      ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, state = 'review'`
+    ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, nowSeconds);
+  }
+
   markReview(messageId: string, reason: string): void {
     this.db.query("UPDATE pending_posts SET state = 'review', reason = ? WHERE message_id = ?").run(reason, messageId);
   }

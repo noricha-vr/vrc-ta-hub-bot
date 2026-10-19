@@ -404,6 +404,13 @@ test("retry は本文なしの記録を残し、purge の後も Gateway から�
   }
 });
 
+test("新しい投稿の確認対象は、受信箱から消す前に記録する", async () => {
+  const f = fixture(); const item = post(); f.inbox.save(item); f.judge.answer("application", 0.5);
+  f.inbox.ack = () => { throw new Error("busy"); };
+  await expect(processInboxMessage(f.extractor, f.inbox, "meeting-1", item, 1_800_000_000)).rejects.toThrow("busy");
+  expect(f.store.pending(item.id)).toMatchObject({ state: "review", reason: "uncertain", meetingId: "meeting-1", authorId: "20" });
+});
+
 test("再試行の後で ack に失敗しても、記録が残って次の回で取り直せる", async () => {
   const f = retryFixture(); const item = post(); f.gateway.history = [item]; const now = 1_800_000_000;
   f.judge.replies.push(new Error("down"));
