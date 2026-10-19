@@ -55,3 +55,21 @@ for (const how of ["ack", "purge"] as const) {
     store.close();
   });
 }
+
+// busy_timeout（5 秒）だけ待ってから busy=1 が返る
+test("WAL を切り詰められない時は成功扱いにしない", () => {
+  const dir = mkdtempSync(join(tmpdir(), "store-"));
+  dirs.push(dir);
+  const path = join(dir, "state.sqlite");
+  const store = new MessageStore(path);
+  store.save(message("10"));
+  const { Database } = require("bun:sqlite");
+  const reader = new Database(path);
+  reader.exec("BEGIN");
+  reader.query("SELECT count(*) FROM inbox").get();
+  expect(() => store.ack("c1", "10")).toThrow("WAL checkpoint incomplete");
+  reader.exec("COMMIT");
+  reader.close();
+  store.purge(0, Math.floor(Date.now() / 1000) + 10);
+  store.close();
+}, 15_000);

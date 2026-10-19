@@ -8,7 +8,8 @@ import { MessageStore } from "./store";
 
 // 1 時間ごとの削除の遅れを足しても 24 時間を超えないよう、期限は 23 時間にする。
 export const INBOX_MAX_AGE_SECONDS = 23 * 3600;
-export const INBOX_PURGE_INTERVAL_MS = 3_600_000;
+// 失敗しても短い間隔で再試行し、期限＋周期が 24 時間を超えないようにする
+export const INBOX_PURGE_INTERVAL_MS = 300_000;
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const log = (event: string) => console.error(JSON.stringify({ time: new Date().toISOString(), event }));

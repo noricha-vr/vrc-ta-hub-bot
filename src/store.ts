@@ -24,6 +24,9 @@ export class MessageStore {
         PRIMARY KEY (channel_id, message_id)
       );
     `);
+    // secure_delete は過去の削除に遡らない。前の版で空き頁に残った本文を起動時に一度消す。
+    this.db.exec("VACUUM");
+    this.truncateWal();
   }
 
   cursor(channelId: string): string {
@@ -64,7 +67,9 @@ export class MessageStore {
 
   /** secure_delete で上書きした頁を本体へ戻し、本文の残る WAL を空にする。 */
   private truncateWal(): void {
-    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    // 読み取り中の接続があると例外ではなく busy=1 が返る。成功扱いにせず呼び出し元で再試行させる。
+    const result = this.db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    if (!result || result.busy !== 0) throw new Error("WAL checkpoint incomplete");
   }
 
   messages(channelId: string): GatewayMessage[] {
