@@ -210,10 +210,13 @@ export class HubSetup {
     }
     this.leaving.add(s.guildId);
     try {
-      this.mutate(s.guildId, () => this.store.leave(s.guildId, community.id));
+      this.mutate(s.guildId, () => {
+        this.store.leave(s.guildId, community.id);
+        if (this.store.settings(s.guildId).length === 0) this.store.markPendingLeave(s.guildId);
+      });
       this.log("hub_left");
       try { await i.edit(text("集会の設定と未承認の下書きを削除しました。")); }
-      finally { if (this.store.settings(s.guildId).length === 0) await this.gateway.leaveGuild(s.guildId); }
+      finally { if (this.store.pendingLeaves().includes(s.guildId)) await this.leaveGuild(s.guildId); }
     } finally {
       this.invalidate(s.guildId);
       this.leaving.delete(s.guildId);
@@ -226,8 +229,19 @@ export class HubSetup {
     try { operation(); } finally { this.changed(); }
   }
 
+  private async leaveGuild(guildId: string): Promise<void> {
+    await this.gateway.leaveGuild(guildId);
+    this.store.clearPendingLeave(guildId);
+  }
+
   guildsReady(guildIds: string[]): void {
     const joined = new Set(guildIds);
+    // 退出に失敗したまま残ったサーバーは、接続のたびに退出し直す。もう居なければ記録だけ消す。
+    for (const guildId of this.store.pendingLeaves()) {
+      if (!joined.has(guildId)) { this.store.clearPendingLeave(guildId); continue; }
+      if (this.store.settings(guildId).length) { this.store.clearPendingLeave(guildId); continue; }
+      void this.leaveGuild(guildId).catch(() => this.log("hub_leave_retry_failed"));
+    }
     for (const guildId of new Set(this.store.settings().map(s => s.guildId))) {
       if (!joined.has(guildId)) this.guildDeleted(guildId);
     }

@@ -37,6 +37,7 @@ export class HubStore extends MessageStore {
         id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, community_id INTEGER NOT NULL,
         source_url TEXT NOT NULL, created_at TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS hub_pending_leaves (guild_id TEXT PRIMARY KEY);
     `);
     const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(hub_channels)").all();
     if (!columns.some(column => column.name === "cursor")) {
@@ -95,6 +96,7 @@ export class HubStore extends MessageStore {
   configure(setting: Omit<HubSetting, "paused">, baseline: string): void {
     if (!setting.channelIds.length || setting.channelIds.length > 25) throw new Error("Invalid channel selection");
     this.db.transaction(() => {
+      this.db.query("DELETE FROM hub_pending_leaves WHERE guild_id = ?").run(setting.guildId);
       const old = this.db.query<{ channel_id: string; baseline: string; cursor: string }, [string, number]>(
         "SELECT channel_id, baseline, cursor FROM hub_channels WHERE guild_id = ? AND community_id = ?",
       ).all(setting.guildId, setting.community.id);
@@ -112,6 +114,19 @@ export class HubStore extends MessageStore {
     this.truncateWal();
   }
 
+  /** 最後の設定を外した後、サーバーからの退出が済むまで残す。失敗しても次の接続で退出し直す。 */
+  markPendingLeave(guildId: string): void {
+    this.db.query("INSERT OR IGNORE INTO hub_pending_leaves (guild_id) VALUES (?)").run(guildId);
+  }
+
+  clearPendingLeave(guildId: string): void {
+    this.db.query("DELETE FROM hub_pending_leaves WHERE guild_id = ?").run(guildId);
+  }
+
+  pendingLeaves(): string[] {
+    return this.db.query<{ guild_id: string }, []>("SELECT guild_id FROM hub_pending_leaves ORDER BY guild_id").all().map(row => row.guild_id);
+  }
+
   pause(guildId: string, communityId: number): void {
     this.db.query("UPDATE hub_settings SET paused = 1 WHERE guild_id = ? AND community_id = ?").run(guildId, communityId);
   }
@@ -123,7 +138,10 @@ export class HubStore extends MessageStore {
         this.db.query("DELETE FROM hub_settings WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);
         this.db.query("DELETE FROM hub_channels WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);
       }
-      if (communityId === undefined) this.db.query("DELETE FROM hub_drafts WHERE guild_id = ? AND approved = 0").run(guildId);
+      if (communityId === undefined) {
+        this.db.query("DELETE FROM hub_drafts WHERE guild_id = ? AND approved = 0").run(guildId);
+        this.db.query("DELETE FROM hub_pending_leaves WHERE guild_id = ?").run(guildId);
+      }
       else this.db.query("DELETE FROM hub_drafts WHERE guild_id = ? AND community_id = ? AND approved = 0").run(guildId, communityId);
       this.removeOrphanedChannels(settings.flatMap(setting => setting.channelIds));
     })();

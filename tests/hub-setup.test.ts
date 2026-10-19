@@ -416,3 +416,20 @@ test("leaving one community erases shared-channel bodies older than every remain
   f.store.leave("100", 1);
   expect(f.store.messages("10").map(m => m.id)).toEqual(["250"]);
 });
+
+test("a failed leave of the last guild is retried on the next ready and forgotten once the bot is gone", async () => {
+  const f = fixture(); await f.setup(["10"]);
+  f.gateway.beforeLeave = async () => { throw new Error("rest down"); };
+  await f.action("leave").catch(() => {});
+  expect(f.store.settings()).toEqual([]);
+  expect(f.store.pendingLeaves()).toEqual(["100"]);
+  f.gateway.beforeLeave = async () => {};
+  f.hub.guildsReady(["100"]);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(f.gateway.leftGuilds).toEqual(["100", "100"]);
+  expect(f.store.pendingLeaves()).toEqual([]);
+  f.store.markPendingLeave("100");
+  f.hub.guildsReady([]);
+  expect(f.store.pendingLeaves()).toEqual([]);
+  expect(f.gateway.leftGuilds).toHaveLength(2);
+});
