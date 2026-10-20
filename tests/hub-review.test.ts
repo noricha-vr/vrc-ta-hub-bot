@@ -7,7 +7,7 @@ import { HubApi, type HubRequest } from "../src/hub-api";
 import { HubBot } from "../src/bot";
 import { HubDeliveryStore } from "../src/hub-delivery-store";
 import { ExtractionStore, type TalkDraft } from "../src/extraction-store";
-import { HubReview, eventDateLabel } from "../src/hub-review";
+import { HubReview, eventDateLabel, sourceFor } from "../src/hub-review";
 import { HubPipeline } from "../src/hub-pipeline";
 import { HubStore, type NotificationTarget } from "../src/hub-store";
 import { HubSetup, type HubInteraction, type HubView } from "../src/hub-setup";
@@ -161,7 +161,7 @@ test("作成前に記録し pending・出典・X-API-Key で登録し、設定�
   expect(f.notifications[0]).toMatchObject({ guildId: "100", target: { type: "channel", channelId: "11" } });
   expect(f.notifications[0]!.view.content).not.toContain("<@123>");
   const lines = f.notifications[0]!.view.content.split("\n");
-  expect(lines[0]).toBe("承認待ちの発表があります。Hub で内容を確認してください。");
+  expect(lines[0]).toBe("承認待ちの発表があります。");
   expect(lines[1]).toMatch(/^日付：\d{4}-\d{2}-\d{2}\([日月火水木金土]\)$/);
   expect(lines[2]).toStartWith("発表者：");
   expect(lines[3]).toStartWith("テーマ：");
@@ -1048,4 +1048,12 @@ test("取り外した集会の再試行が 50 件あっても有効な集会の�
 test("開催日に曜日を添える", () => {
   expect(eventDateLabel("2026-11-03")).toBe("2026-11-03(火)");
   expect(eventDateLabel("2026-10-22")).toBe("2026-10-22(木)");
+});
+
+test("通知の出典は通知先のサーバーのものを選ぶ", () => {
+  const old = { messageId: "101", channelId: "10", url: "https://discord.com/channels/100/10/101" };
+  const fresh = { messageId: "201", channelId: "21", url: "https://discord.com/channels/200/21/201" };
+  expect(sourceFor({ sources: [old, fresh] }, "200")).toBe(fresh.url);
+  expect(sourceFor({ sources: [old, fresh] }, "100")).toBe(old.url);
+  expect(sourceFor({ sources: [old] }, "300")).toBe(old.url);
 });

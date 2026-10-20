@@ -162,7 +162,7 @@ export class HubReview {
     const notificationHash = fingerprint([row.synced_hash, setting.notification]);
     if (row.notified_hash !== notificationHash) {
       const view: HubView = {
-        content: `承認待ちの発表があります。Hub で内容を確認してください。\n日付：${eventDateLabel(draft.eventDate)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\nテーマ：${discordText(draft.title).slice(0, 300)}\n${draft.sources[0]!.url}`,
+        content: `承認待ちの発表があります。\n日付：${eventDateLabel(draft.eventDate)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\nテーマ：${discordText(draft.title).slice(0, 300)}\n${sourceFor(draft, setting.guildId)}`,
         controls: [{ type: "buttons", buttons: [
           { id: `hub-review:${row.draft_id}:approved`, label: "承認" },
           { url: this.hub.editUrl(row.hub_id!), label: "直す" },
@@ -284,4 +284,10 @@ const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 export function eventDateLabel(date: string): string {
   const day = new Date(`${date}T00:00:00Z`);
   return Number.isNaN(day.getTime()) ? discordText(date) : `${discordText(date)}(${WEEKDAYS[day.getUTCDay()]})`;
+}
+
+/** 通知先のサーバーの出典を優先する（別サーバーで設定し直した時に、見られない旧サーバーのリンクを出さない）。 */
+export function sourceFor(draft: Pick<TalkDraft, "sources">, guildId: string): string {
+  const prefix = `https://discord.com/channels/${guildId}/`;
+  return [...draft.sources].reverse().find(source => source.url.startsWith(prefix))?.url ?? draft.sources.at(-1)!.url;
 }
