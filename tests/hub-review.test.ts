@@ -173,6 +173,14 @@ async function setup(f: ReturnType<typeof fixture>, actor: string) {
   expect(views.at(-1)!.content).toContain("設定を保存しました");
 }
 
+test("資料 URL の Markdown 記号とメンションを符号化して文字どおりに出す", async () => {
+  const f = fixture(); f.create(userId, "101", [{ kind: "slides", url: "https://example.invalid/a||hidden||_*x*_~~s~~`c`[l](u)\\@everyone" }]);
+  await f.review.flush();
+  const line = f.notifications[0]!.view.content.split("\n")[4]!;
+  expect(line).toStartWith("資料：https://example.invalid/a%7C%7Chidden%7C%7C%5F%2Ax%2A%5F%7E%7Es%7E%7E%60c%60%5Bl%5D%28u%29");
+  expect(line).not.toMatch(/[|*_~`[\]()@]/);
+});
+
 test("長すぎる資料 URL は通知に出さず、件数だけ書いて 2,000 文字に収める", async () => {
   const long = `https://example.invalid/slides/${"a".repeat(1900)}`;
   const f = fixture(); f.create(userId, "101", [{ kind: "slides", url: long }]);

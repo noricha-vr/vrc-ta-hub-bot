@@ -279,7 +279,8 @@ export class HubReview {
   private notificationView(row: HubDelivery, draft: TalkDraft, setting: HubSetting): HubView {
     const materials = draft.materials.flatMap(m => {
       const url = httpUrl(m.url);
-      return url ? [url.replace(/@/g, "%40").replace(/[<>]/g, c => c === "<" ? "%3C" : "%3E")] : [];
+      // メンションと Markdown の記号を百分率符号化し、文字どおりの URL として表示する。
+      return url ? [url.replace(/[@<>*_~|`\\[\]()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)] : [];
     });
     // 長すぎる URL は通知の上限（2,000 文字）を超えるので出さず、件数だけ書く。
     const shown = materials.find(url => url.length <= 500);
