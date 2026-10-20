@@ -66,6 +66,9 @@ test("端末を閉じた時の SIGHUP も正常停止としてロックを解放
   const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   expect(source).toContain("process.on(signal, onSignal)");
   expect(source).not.toContain("process.once(");
+  // 初期化中に止まってもロックを残さないよう、保存先を開く前に受け始める。
+  expect(source.indexOf("process.on(signal, onSignal)")).toBeLessThan(source.indexOf("new HubStore("));
+  expect(source.indexOf("process.on(signal, onSignal)")).toBeGreaterThan(source.indexOf("acquireLock("));
 });
 
 for (const [pid, alive] of [[process.pid, true], [2 ** 22 + 12345, false]] as const)

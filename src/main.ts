@@ -22,7 +22,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 // 端末やセッションを閉じた時の SIGHUP も正常停止にして、ロックを残さない。
 export const SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-const log = (event: string, fields?: { keys?: string[]; reason?: string; lockHolderAlive?: boolean }) => console.error(JSON.stringify({ time: new Date().toISOString(), event, ...fields }));
+const log = (event: string, fields?: { keys?: string[]; reason?: string; lockHolderAlive?: boolean | "unknown" }) => console.error(JSON.stringify({ time: new Date().toISOString(), event, ...fields }));
 
 /** mkdirSync の mode は既存のディレクトリに効かないので、起動ごとに権限をそろえる。 */
 export function restrictDataPermissions(dataDir: string, dbPath: string): void {
@@ -59,6 +59,9 @@ async function main(): Promise<void> {
   const onSignal = () => {
     void shutdown(false).then(() => process.exit(0), () => process.exit(1));
   };
+  // ロックを取ったらすぐ受ける（初期化中に止まってもロックを残さない）。
+  // 停止を待つ間に同じシグナルが再び来ても既定の終了にならないよう、once でなく on で受け続ける。
+  for (const signal of SHUTDOWN_SIGNALS) process.on(signal, onSignal);
   try {
     const dbPath = join(config.dataDir, "state.sqlite");
     store = new HubStore(dbPath);
@@ -86,8 +89,6 @@ async function main(): Promise<void> {
       log,
       onFatal: () => { void shutdown(true).finally(() => process.exit(1)); },
     });
-    // 停止を待つ間に同じシグナルが再び来ても既定の終了にならないよう、once でなく on で受け続ける。
-    for (const signal of SHUTDOWN_SIGNALS) process.on(signal, onSignal);
     await bot.start(config.discordToken);
   } catch {
     await shutdown(true);

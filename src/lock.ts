@@ -2,14 +2,20 @@ import { closeSync, fstatSync, openSync, readFileSync, statSync, unlinkSync, wri
 
 /** ロックがあって起動できない。持ち主が生きているかは判断材料として出すだけで、ロックは奪わない。 */
 export class LockExistsError extends Error {
-  constructor(readonly holderAlive: boolean) {
+  constructor(readonly holderAlive: boolean | "unknown") {
     super("Bot lock already exists; check that no other instance is running");
   }
 }
 
-function holderAlive(path: string): boolean {
+function holderAlive(path: string): boolean | "unknown" {
+  let pid: unknown;
   try {
-    const pid = (JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown }).pid;
+    pid = (JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown }).pid;
+  } catch {
+    // 相手が PID を書き込む前など、読めない時は生死を決めない。
+    return "unknown";
+  }
+  try {
     // 自分の PID と同じなら、再利用された番号で前の持ち主ではない。
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
     process.kill(pid, 0);

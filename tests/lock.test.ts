@@ -39,3 +39,14 @@ test("ロックの PID が自分自身なら持ち主は生きていない扱い
   expect((error as LockExistsError).holderAlive).toBe(false);
   expect(JSON.parse(readFileSync(path, "utf8")).pid).toBe(process.pid);
 });
+
+test("ロックの中身がまだ書かれていない時は、持ち主の生死を決めない", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hub-lock-test-"));
+  dirs.push(dir);
+  const path = join(dir, "bot.lock");
+  writeFileSync(path, "");
+  let error: unknown;
+  try { acquireLock(path); } catch (caught) { error = caught; }
+  expect((error as LockExistsError).holderAlive).toBe("unknown");
+  expect(existsSync(path)).toBe(true);
+});
