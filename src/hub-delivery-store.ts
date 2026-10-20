@@ -180,7 +180,10 @@ export class HubDeliveryStore {
     return this.db.query<HubReviewNotification, [number, string | null, string | null]>(`SELECT n.* FROM hub_review_notifications n
       JOIN hub_deliveries d ON d.draft_id = n.draft_id
       WHERE ((d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0)
-        OR (d.state = 'ready' AND n.content_hash <> d.synced_hash))
+        OR (d.state = 'ready' AND n.content_hash <> d.synced_hash)
+        -- 確定後の続報。本文の分からない旧記録（content_hash が空）は書き換えない。
+        OR (d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 1
+          AND n.content_hash <> '' AND n.content_hash <> d.synced_hash))
         AND n.closed_reason = '' AND n.next_at <= ?
         AND (? IS NULL OR n.draft_id = ?) ORDER BY n.rowid`).all(now, id ?? null, id ?? null);
   }
@@ -283,7 +286,8 @@ export class HubDeliveryStore {
         SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
       ) AND (
         (state = 'closed' AND reason IN ('approved', 'rejected') AND (attempts > 0 OR EXISTS (
-          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.edited = 0 AND n.closed_reason = ''
+          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.closed_reason = ''
+            AND (n.edited = 0 OR n.attempts > 0)
         ))) OR
         (state <> 'closed' AND (reason <> '' OR EXISTS (
           SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.attempts > 0 AND n.closed_reason = ''

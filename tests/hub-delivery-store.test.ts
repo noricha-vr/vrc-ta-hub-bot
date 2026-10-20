@@ -221,7 +221,11 @@ test("本文の編集待ちは再起動後も保持し、本文編集済みで�
     expect(result).toMatchObject({ edited: 0, content_hash: "second" });
     store.notificationEdited(result); store.synced("draft", "third");
     store.close(); store = new HubDeliveryStore(path);
+    // 確定後の続報は、結果の編集を保ったまま本文の更新待ちになる。
+    const after = store.dueNotifications(Number.MAX_SAFE_INTEGER);
+    expect(after).toHaveLength(1); expect(after[0]).toMatchObject({ edited: 1, content_hash: "second" });
+    store.notificationUpdated(after[0]!, "third");
     expect(store.dueNotifications(Number.MAX_SAFE_INTEGER)).toEqual([]);
-    expect(store.notifications("draft")[0]).toMatchObject({ edited: 1, content_hash: "second" });
+    expect(store.notifications("draft")[0]).toMatchObject({ edited: 1, content_hash: "third" });
   } finally { store.close(); }
 });
