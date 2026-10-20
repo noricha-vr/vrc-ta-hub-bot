@@ -1,4 +1,4 @@
-import { extractMaterials, extractTitle, hasTitleLine, httpUrl, resolveEventDate, validEventDate, type Material } from "./extraction-fields";
+import { extractMaterials, extractTitle, hasTitleLine, httpUrl, MAX_TITLE_LENGTH, resolveEventDate, validEventDate, type Material } from "./extraction-fields";
 import { type ExtractionStore, type PendingPost, type PostReference, type SavedDraft, type TalkDraft } from "./extraction-store";
 import type { Gateway, GatewayMessage } from "./gateway";
 import { JudgeError, validAnswer, type ChoiceAnswer, type ChoiceQuestion, type Judge } from "./jev";
@@ -99,10 +99,17 @@ export class PostExtractor {
     const materials = extractMaterials(message.content, message.attachments);
     let question = classification;
     if (materials.length > 0 && !hasTitleLine(message.content)) {
-      const drafts = this.store.forPresenter(meetingId, message.authorId);
+      // 投稿日は開催日と同じ日本時間。古い応募・件数・題名の長さを制限し、分類の入力を抑える。
+      const posted = Date.parse(message.createdAt);
+      const since = Number.isFinite(posted)
+        ? new Date(posted + 9 * 3600_000 - 30 * 86400_000).toISOString().slice(0, 10) : undefined;
+      const drafts = since ? this.store.forPresenter(meetingId, message.authorId)
+        .filter(draft => draft.eventDate >= since)
+        .sort((a, b) => b.eventDate.localeCompare(a.eventDate))
+        .slice(0, 5) : [];
       if (drafts.length > 0) {
         // 利用者由来の題名も未信頼の選択肢データとして渡す。既存の本文や他の項目は含めない。
-        const applications = drafts.map(({ title, eventDate }) => ({ title, eventDate }));
+        const applications = drafts.map(({ title, eventDate }) => ({ title: [...title].slice(0, MAX_TITLE_LENGTH).join(""), eventDate }));
         question = { ...classification, criteria: {
           ...classification.criteria,
           follow_up: `${classification.criteria.follow_up}. The author already has applications for this meeting (event date and talk title): ${JSON.stringify(applications)}`,
@@ -195,12 +202,23 @@ function draftLabel(draft: TalkDraft): string {
 
 /** 日付か引用題名で 1 件に決まる時だけ採用する。異なる下書きを指す時も API に任せる。 */
 function matchingDraft(message: GatewayMessage, drafts: readonly TalkDraft[]): TalkDraft | undefined {
-  const date = resolveEventDate(message.content, drafts.map(draft => draft.eventDate), message.createdAt, { includePast: true });
-  const titles = new Set([...message.content.matchAll(/「([^「」『』]+)」|『([^「」『』]+)』/g)]
-    .map(match => (match[1] ?? match[2])!.trim()));
-  const matches = drafts.filter(draft => (date.status === "resolved" && draft.eventDate === date.date)
-    || titles.has(draft.title.trim()));
-  return matches.length === 1 ? matches[0] : undefined;
+  const text = message.content.replace(/https?:\/\/\S+/gi, "");
+  if (/(?:では|じゃ)(?:ありません|ない|なく|無い|無く|ございません)|違(?:います|う|って)/.test(text)) return undefined;
+  const titles = [...text.matchAll(/「([^「」『』]+)」|『([^「」『』]+)』/g)]
+    .map(match => (match[1] ?? match[2])!.trim());
+  // 空の引用・入れ子・閉じ忘れも、単独の題名として確定しない。
+  const quotationMarks = text.match(/[「」『』]/g) ?? [];
+  if (titles.length > 1 || quotationMarks.length !== titles.length * 2) return undefined;
+  const titleMatches = titles.length === 1 ? drafts.filter(draft => draft.title.trim() === titles[0]) : [];
+  if (titles.length === 1 && titleMatches.length !== 1) return undefined;
+  const titleMatch = titleMatches[0];
+  const date = resolveEventDate(text, drafts.map(draft => draft.eventDate), message.createdAt, { includePast: true });
+  if (date.status === "resolved") {
+    const dateMatches = drafts.filter(draft => draft.eventDate === date.date);
+    const dateMatch = dateMatches.length === 1 ? dateMatches[0] : undefined;
+    return dateMatch && (!titleMatch || titleMatch.id === dateMatch.id) ? dateMatch : undefined;
+  }
+  return titleMatch;
 }
 
 export const MAX_RETRY_ATTEMPTS = 8;

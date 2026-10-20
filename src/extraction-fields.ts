@@ -59,6 +59,7 @@ export function hasTitleLine(content: string): boolean {
   return content.split(/\r?\n/).some(line => {
     const text = line.trim().replace(/。$/, "").trim();
     return QUOTED.test(text) || LABELLED.test(text) || EMBEDDED_LABEL.test(text)
+      || /(?:題名|タイトル|演題)\s*は\s*\S/.test(text)
       || /(?:題名|タイトル|演題|title)\s*[「『"“]/i.test(text);
   });
 }

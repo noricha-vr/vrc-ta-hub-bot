@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_RETRY_ATTEMPTS, PostExtractor, processDueRetries, processInboxMessage, type MeetingDates } from "../src/extract";
-import { extractMaterials, extractTitle, resolveEventDate } from "../src/extraction-fields";
+import { extractMaterials, extractTitle, hasTitleLine, resolveEventDate } from "../src/extraction-fields";
 import { ExtractionStore } from "../src/extraction-store";
 import type { GatewayMessage } from "../src/gateway";
 import type { ChoiceAnswer, Judge, JudgeRequest } from "../src/jev";
@@ -143,6 +143,104 @@ for (const quoted of ["『 型の話 』", "「型の話」"]) {
     expect(f.judge.requests[0]!.questions.classification!.criteria.follow_up).toContain(draft.eventDate);
   });
 }
+
+for (const content of [
+  ...["ではありません", "ではない", "じゃない", "ではなく", "違います", "ではございません"]
+    .map(negation => `『型の話』の資料${negation}。Bun の話のスライドを追加します https://example.invalid/slides/extra`),
+  "資料です https://example.invalid/slides/『型の話』",
+  "資料です https://example.invalid/slides/「型の話」?date=2026-10-23",
+  "『型の話』と「補足」のスライドです https://example.invalid/slides/extra",
+  "『型の話』と『型の話』のスライドです https://example.invalid/slides/extra",
+  "『型の話』と「」のスライドです https://example.invalid/slides/extra",
+  "『参考「型の話」』のスライドです https://example.invalid/slides/extra",
+  "10/23 の『未登録の話』のスライドです https://example.invalid/slides/extra",
+]) {
+  test(`否定・URL 中の引用・曖昧な引用は宛先を判定 API に任せる: ${content}`, async () => {
+    const f = fixture();
+    const draft = addDraft(f, "2026-10-23");
+    f.judge.answer("follow_up"); f.judge.answer("none");
+    expect(await f.extractor.extract("meeting-1", post("101", content)))
+      .toMatchObject({ status: "review", reason: "no_choice" });
+    expect(f.judge.requests.map(request => Object.keys(request.questions))).toEqual([["classification"], ["draft"]]);
+    expect(f.store.get(draft.id)).toEqual(draft);
+    expect(f.store.forMessage("101")).toBeUndefined();
+  });
+}
+
+test("URL 中の引用は本文の日付による宛先の確定を妨げない", async () => {
+  const f = fixture(); const draft = addDraft(f, "2026-10-23");
+  const other = addDraft(f, "2026-11-06", "別の題名");
+  f.judge.answer("follow_up");
+  expect(await f.extractor.extract("meeting-1", post("101", "10/23 のスライドです https://example.invalid/slides/『別の題名』")))
+    .toMatchObject({ status: "candidate", action: "updated", draft: { id: draft.id } });
+  expect(f.judge.requests).toHaveLength(1);
+  expect(f.store.get(other.id)).toEqual(other);
+});
+
+test("本文の日付と 1 組の引用が同じ下書きを指す時は宛先の判定 API なしで紐づく", async () => {
+  const f = fixture(); const draft = addDraft(f, "2026-10-23");
+  addDraft(f, "2026-11-06", "別の題名");
+  f.judge.answer("follow_up");
+  expect(await f.extractor.extract("meeting-1", post("101", "10/23 の『型の話』のスライドです https://example.invalid/slides/extra")))
+    .toMatchObject({ status: "candidate", action: "updated", draft: { id: draft.id } });
+  expect(f.judge.requests).toHaveLength(1);
+});
+
+for (const label of ["題名", "タイトル", "演題"]) {
+  for (const title of ["「新しい話」です。", "新しい話"]) {
+    test(`${label}は${title} を題名の行とみなし、分類の質問に既存の応募を付けない`, async () => {
+      const content = `10/23 に応募します\n${label}は${title}\nスライド https://example.invalid/slides/new`;
+      expect(hasTitleLine(content)).toBe(true);
+      const f = fixture(); const draft = addDraft(f, "2026-10-23");
+      f.judge.answer("unrelated");
+      expect(await f.extractor.extract("meeting-1", post("101", content))).toMatchObject({ status: "unrelated" });
+      expect(f.judge.requests[0]!.questions.classification!.criteria.follow_up).not.toContain(draft.title);
+    });
+  }
+}
+
+function classificationApplications(judge: FixedJudge): Array<{ title: string; eventDate: string }> {
+  const description = judge.requests[0]!.questions.classification!.criteria.follow_up!;
+  return JSON.parse(description.slice(description.indexOf("[{")));
+}
+
+test("分類に渡す既存の応募は開催日の新しい順に最大 5 件", async () => {
+  const f = fixture();
+  // 保存順とは異なる開催日順にする。将来の開催日も候補に含める。
+  for (const day of [20, 25, 23, 21, 26, 24, 22]) addDraft(f, `2026-10-${day}`, `発表 ${day}`);
+  f.judge.answer("unrelated");
+  await f.extractor.extract("meeting-1", post("101", "スライドです https://example.invalid/slides/extra"));
+  expect(classificationApplications(f.judge)).toEqual([26, 25, 24, 23, 22]
+    .map(day => ({ title: `発表 ${day}`, eventDate: `2026-10-${day}` })));
+});
+
+test("分類に渡す既存の応募は日本時間の投稿日から 30 日前を含み、それ以前を除く", async () => {
+  const f = fixture();
+  for (const eventDate of ["2026-09-18", "2026-09-19", "2026-10-01"]) addDraft(f, eventDate);
+  f.judge.answer("unrelated");
+  await f.extractor.extract("meeting-1", {
+    ...post("101", "スライドです https://example.invalid/slides/extra"), createdAt: "2026-10-18T15:00:00Z",
+  });
+  expect(classificationApplications(f.judge)).toEqual([
+    { title: "型の話", eventDate: "2026-10-01" }, { title: "型の話", eventDate: "2026-09-19" },
+  ]);
+});
+
+test("30 日より前の応募しかない時は分類の質問に既存の応募を付けない", async () => {
+  const f = fixture(); const draft = addDraft(f, "2026-09-18");
+  f.judge.answer("unrelated");
+  await f.extractor.extract("meeting-1", post("101", "スライドです https://example.invalid/slides/extra"));
+  expect(f.judge.requests[0]!.questions.classification!.criteria.follow_up).not.toContain(draft.title);
+});
+
+test("分類に渡す題名は Unicode の文字で 80 字に切り、保存した題名は変更しない", async () => {
+  const f = fixture(); const title = "話😀".repeat(60);
+  const draft = addDraft(f, "2026-10-23", title);
+  f.judge.answer("unrelated");
+  await f.extractor.extract("meeting-1", post("101", "スライドです https://example.invalid/slides/extra"));
+  expect(classificationApplications(f.judge)).toEqual([{ title: "話😀".repeat(40), eventDate: draft.eventDate }]);
+  expect(f.store.get(draft.id)?.title).toBe(title);
+});
 
 test("資料の分類には同じ投稿者・集会の題名と開催日だけを渡し、応募本文や他の項目を含めない", async () => {
   const f = fixture();
