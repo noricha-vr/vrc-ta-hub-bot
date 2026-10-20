@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { HubBot } from "./bot";
-import { loadConfig } from "./config";
+import { ConfigConflictError, loadConfigFile } from "./config";
 import { DiscordGateway } from "./discord-gateway";
 import { acquireLock } from "./lock";
 import { HubStore } from "./hub-store";
@@ -19,7 +19,7 @@ export const INBOX_MAX_AGE_SECONDS = 23 * 3600;
 export const INBOX_PURGE_INTERVAL_MS = 300_000;
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
-const log = (event: string) => console.error(JSON.stringify({ time: new Date().toISOString(), event }));
+const log = (event: string, fields?: { keys: string[] }) => console.error(JSON.stringify({ time: new Date().toISOString(), event, ...fields }));
 
 /** mkdirSync の mode は既存のディレクトリに効かないので、起動ごとに権限をそろえる。 */
 export function restrictDataPermissions(dataDir: string, dbPath: string): void {
@@ -30,7 +30,7 @@ export function restrictDataPermissions(dataDir: string, dbPath: string): void {
 }
 
 async function main(): Promise<void> {
-  const config = loadConfig(process.env);
+  const config = loadConfigFile(process.env);
   mkdirSync(config.dataDir, { recursive: true, mode: DIR_MODE });
   chmodSync(config.dataDir, DIR_MODE);
   const release = acquireLock(join(config.dataDir, "bot.lock"));
@@ -77,6 +77,8 @@ async function main(): Promise<void> {
       hub,
       work,
       healthPath: join(config.dataDir, "health.json"),
+      envFilePath: config.envFilePath,
+      hubHost: new URL(config.hubBaseUrl).hostname,
       log,
       onFatal: () => { void shutdown(true).finally(() => process.exit(1)); },
     });
@@ -92,8 +94,9 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(() => {
+  main().catch(error => {
     // Never log raw SDK errors, tokens, request URLs, or message contents.
+    if (error instanceof ConfigConflictError) log("bot_config_conflict", { keys: error.keys });
     log("bot_start_failed");
     process.exit(1);
   });

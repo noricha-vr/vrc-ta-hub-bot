@@ -17,7 +17,7 @@ bunx tsc --noEmit
 
 ## 設定と起動
 
-`.env.example` を `.env` にコピーし、次の環境変数を設定します。秘密の値を Git に含めないでください。
+`.env.example` を `.env.local` にコピーし、次の環境変数を設定します。秘密の値を Git に含めないでください。
 
 | 変数 | 用途 |
 | --- | --- |
@@ -26,10 +26,18 @@ bunx tsc --noEmit
 | `HUB_BASE_URL` | Hub API のベース URL（必須。HTTPS のみ。localhost / 127.0.0.1 だけ HTTP 可） |
 | `JEV_API_KEY` | 後続処理用の予約設定（必須、現段階では未使用） |
 | `BOT_DATA_DIR` | 状態の保存先（省略時は作業ディレクトリの `data/`） |
+| `BOT_ENV_FILE` | 読み込む設定ファイル（省略時は作業ディレクトリの `.env.local`。起動元で指定） |
 
 ```sh
 bun start
 ```
+
+`start` / `dev` は Bun の自動 `.env` 読み込みを無効にし、`BOT_ENV_FILE` のファイルを明示的に読みます。
+ファイルが読めない場合や、ファイル内のキーと起動元の環境変数の値が異なる場合は、接続前に起動を止めます。
+不一致は標準エラーの JSON ログ `bot_config_conflict` の `keys` にキー名だけを出し、値は出しません。
+設定ファイルは `KEY=value` 形式で、コメント・引用符を使えます。値の中の `$VAR` / `${VAR}` は展開せず、値を直接記入します。
+常駐は launchd などのクリーンな環境で起動し、作業ディレクトリと必要な `BOT_ENV_FILE` を明示してください。
+対話シェルの別環境向け設定を引き継がないようにします。
 
 このコマンドは実際に Discord へ接続します。開発時に接続は不要です。Bot には対象チャンネルの
 View Channel と Read Message History が必要です。Developer Portal で Message Content Intent を有効にします。
@@ -78,6 +86,8 @@ SIGINT / SIGTERM では接続・SQLite を閉じてロックを解除します�
 
 | フィールド | 意味・判定例 |
 | --- | --- |
+| `envFilePath` | 読み込んだ設定ファイルの絶対パス。意図した環境のファイルか確認 |
+| `hubHost` | 接続先 `HUB_BASE_URL` のホスト名。パス・クエリ・キーは含まない |
 | `startedAt` / `updatedAt` | 起動時刻・最終更新時刻。ファイルなし、JSON 不正、更新が 15 秒超古い場合は要確認 |
 | `lastReceivedAt` | 選択チャンネルの新着または履歴を最後に受け取った時刻。投稿がなければ古くても正常 |
 | `connectionState` | `connecting` / `connected` / `disconnected` / `reconnecting` / `error` / `stopped` |

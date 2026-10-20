@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HubBot } from "../src/bot";
+import { loadConfig } from "../src/config";
 import type { Health } from "../src/health";
 import { MessageStore } from "../src/store";
 import { FakeGateway, message } from "./fake-gateway";
@@ -22,6 +23,9 @@ function fixture(channelIds = ["10"], heartbeatMs = 60000) {
   let fatal = false;
   const bot = new HubBot(gateway, store, {
     channelIds, healthPath, heartbeatMs,
+    envFilePath: join(dir, "bot.env"),
+    hubHost: new URL(loadConfig({ DISCORD_TOKEN: "token", HUB_API_KEY: "key", JEV_API_KEY: "judge",
+      HUB_BASE_URL: "https://example.invalid:8443/api-secret-path?secret=hidden" }).hubBaseUrl).hostname,
     log: event => logs.push(event), onFatal: () => { fatal = true; },
   });
   cleanups.push(async () => {
@@ -215,6 +219,10 @@ describe("durable gateway ingestion", () => {
     await new Promise(resolve => setTimeout(resolve, 40));
     expect(f.health().updatedAt > previous).toBe(true);
     expect(f.health().connectionState).toBe("connected");
+    expect(f.health().envFilePath).toBe(join(f.dir, "bot.env"));
+    expect(f.health().hubHost).toBe("example.invalid");
+    expect(JSON.stringify(f.health())).not.toContain("hidden");
+    expect(JSON.stringify(f.health())).not.toContain("/api-secret-path");
     expect(f.health().lastReceivedAt).toBeNull();
     expect(f.health().pendingChannelCount).toBe(0);
     expect(f.health().lastSuccessfulSyncAt).not.toBeNull();
@@ -222,6 +230,8 @@ describe("durable gateway ingestion", () => {
     expect(f.health().lastReceivedAt).not.toBeNull();
     await f.bot.stop();
     expect(f.health().connectionState).toBe("stopped");
+    expect(f.health().envFilePath).toBe(join(f.dir, "bot.env"));
+    expect(f.health().hubHost).toBe("example.invalid");
   });
 
   test("startup failure destroys gateway, stops heartbeat, and redacts raw error", async () => {
