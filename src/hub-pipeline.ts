@@ -23,15 +23,18 @@ export class HubPipeline {
     this.extractor = new PostExtractor(judge, extracted,
       async meetingId => (await hub.events(Number(meetingId))).map(event => event.date));
   }
-  run(): Promise<void> {
+  run(channelReady: (channelId: string) => boolean = () => true): Promise<void> {
     if (this.active) return this.active;
-    this.active = this.process().finally(() => { this.active = undefined; });
+    this.active = this.process(channelReady).finally(() => { this.active = undefined; });
     return this.active;
   }
-  private async process(): Promise<void> {
+  private async process(channelReady: (channelId: string) => boolean): Promise<void> {
     await this.review.flush();
     for (const channelId of this.inbox.channelIds()) {
+      if (!channelReady(channelId)) continue;
       for (const message of this.inbox.messages(channelId)) {
+        // 実行中に再接続が始まった場合も、補完が終わるまで新着を抽出しない。
+        if (!channelReady(channelId)) break;
         const pending = this.extractor.store.pending(message.id);
         if (pending) {
           if (pending.state === "review") this.inbox.ack(channelId, message.id);
@@ -51,7 +54,7 @@ export class HubPipeline {
       }
     }
     await processDueRetries(this.extractor, this.inbox, this.gateway, this.now(), pending =>
-      this.inbox.messageSettings(pending.source.channelId, pending.source.messageId)
+      channelReady(pending.source.channelId) && this.inbox.messageSettings(pending.source.channelId, pending.source.messageId)
         .some(s => String(s.community.id) === pending.meetingId));
     await this.review.flush();
   }

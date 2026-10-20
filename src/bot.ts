@@ -11,7 +11,7 @@ interface BotOptions {
   channelIds: string[] | (() => string[]);
   baseline?: (channelId: string) => string;
   hub?: HubSetup;
-  work?: { run(): Promise<void>; review: { handle(interaction: HubInteraction): Promise<void> } };
+  work?: { run(channelReady: (channelId: string) => boolean): Promise<void>; review: { handle(interaction: HubInteraction): Promise<void> } };
   healthPath: string;
   heartbeatMs?: number;
   now?: () => Date;
@@ -177,7 +177,8 @@ export class HubBot {
 
   private processWork(): void {
     if (!this.connected || this.stopped || this.workTask || !this.options.work) return;
-    this.workTask = this.options.work.run().catch(() => this.recordError("hub_pipeline_failed"))
+    this.workTask = this.options.work.run(channelId => this.connected && !this.stopped
+      && this.selected.has(channelId) && !this.pending.has(channelId)).catch(() => this.recordError("hub_pipeline_failed"))
       .finally(() => { this.workTask = undefined; });
   }
 

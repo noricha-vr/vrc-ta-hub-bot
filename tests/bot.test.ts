@@ -346,3 +346,36 @@ test("受信と補完から後続処理を起動し、承認操作と送信処�
   finishWork(); finishReview(); await stopping;
   expect(stopped).toBe(true); expect(gateway.stopped).toBe(true);
 });
+
+test("補完に失敗したチャンネルの新着は待たせ、他のチャンネルの処理を続ける", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hub-worker-test-"));
+  const store = new MessageStore(join(dir, "state.sqlite"));
+  const gateway = new FakeGateway();
+  const processed: string[] = [];
+  const work = {
+    run: async (channelReady: (channelId: string) => boolean) => {
+      for (const channelId of ["10", "11"]) {
+        if (!channelReady(channelId)) continue;
+        for (const item of store.messages(channelId)) {
+          processed.push(item.id); store.ack(channelId, item.id);
+        }
+      }
+    },
+    review: { handle: async () => {} },
+  };
+  const bot = new HubBot(gateway, store, { channelIds: ["10", "11"], work, healthPath: join(dir, "health.json"), heartbeatMs: 60000 });
+  cleanups.push(async () => { await bot.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); });
+  gateway.history = [message("101"), message("201", "11")];
+  gateway.beforeFetch = async channelId => { if (channelId === "10") throw new Error("synthetic history failure"); };
+  await bot.start("fake"); await bot.reconcile(); await Bun.sleep(0);
+  expect(processed).toEqual(["201"]);
+  gateway.events!.message(message("103")); await Bun.sleep(0);
+  gateway.events!.message(message("202", "11")); await Bun.sleep(0);
+  expect(processed).toEqual(["201", "202"]);
+  expect(store.messages("10").map(item => item.id)).toEqual(["103"]);
+  expect(store.cursor("10")).toBe("0");
+  gateway.history.push(message("102"), message("103")); delete gateway.beforeFetch;
+  await bot.reconcile();
+  expect(processed).toEqual(["201", "202", "101", "102", "103"]);
+  expect(store.messages("10")).toEqual([]); expect(store.cursor("10")).toBe("103");
+});

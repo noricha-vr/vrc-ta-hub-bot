@@ -51,6 +51,9 @@ export class HubDeliveryStore {
   creating(id: string, hash: string): void {
     this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ? WHERE draft_id = ?").run(hash, id);
   }
+  requeue(id: string): void {
+    this.db.query("UPDATE hub_deliveries SET state = 'queued', attempted_hash = '' WHERE draft_id = ?").run(id);
+  }
   created(id: string, hubId: number, hash: string): void {
     this.db.query(`UPDATE hub_deliveries SET state = 'ready', hub_id = ?, synced_hash = ?,
       attempts = 0, next_at = 0, reason = '' WHERE draft_id = ?`).run(hubId, hash, id);
@@ -68,7 +71,7 @@ export class HubDeliveryStore {
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string): void {
-    this.db.query("UPDATE hub_deliveries SET decision = ?, discord_id = ?, next_at = 0 WHERE draft_id = ? AND decision IS NULL")
+    this.db.query("UPDATE hub_deliveries SET decision = ?, discord_id = ?, next_at = 0 WHERE draft_id = ?")
       .run(decision, discordId, id);
   }
   clearDecision(id: string): void {

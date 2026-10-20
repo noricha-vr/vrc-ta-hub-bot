@@ -103,7 +103,13 @@ export class HubReview {
       if (events.length !== 1 || !this.setting(row)) throw new HubApiError();
       const fields = this.fields(draft, events[0]!.id);
       this.deliveries.creating(row.draft_id, hash);
-      const id = await this.hub.createDraft(fields, draft.sources[0]!.url);
+      let id: number;
+      try { id = await this.hub.createDraft(fields, draft.sources[0]!.url); }
+      catch (error) {
+        // 明確な拒否は再送できる。応答なしの時だけ creating を残して照合する。
+        if (error instanceof HubApiError && error.status > 0) this.deliveries.requeue(row.draft_id);
+        throw error;
+      }
       this.deliveries.created(row.draft_id, id, hash);
       this.recordDraft(row, draft, id, false);
       this.log("hub_draft_created");
@@ -147,7 +153,11 @@ export class HubReview {
         this.log("hub_review_forbidden"); return "forbidden";
       }
       if (error instanceof HubApiError && error.status === 409) {
-        this.deliveries.closed(row.draft_id, "already_reviewed");
+        const draft = this.extracted.get(row.draft_id)!;
+        const found = await this.hub.findDraft(draft.sources[0]!.url);
+        if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
+        this.recordDraft(row, draft, found.id, found.status === "approved");
+        this.deliveries.closed(row.draft_id, found.status);
         this.log("hub_review_already_processed"); return "processed";
       }
       throw error;
@@ -169,7 +179,8 @@ export class HubReview {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
       if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
-      if (this.busy.has(row.draft_id) || row.decision) {
+      // 権限が未確認の保留は、別の利用者の操作を妨げない。
+      if (this.busy.has(row.draft_id) || (row.decision && row.discord_id === i.userId)) {
         await i.edit(text("この発表は処理中です。しばらく待ってから確認してください。")); return;
       }
       this.busy.add(row.draft_id); locked = row.draft_id;

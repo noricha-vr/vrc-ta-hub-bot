@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HubApi, type HubRequest } from "../src/hub-api";
+import { HubBot } from "../src/bot";
 import { HubDeliveryStore } from "../src/hub-delivery-store";
 import { ExtractionStore, type TalkDraft } from "../src/extraction-store";
 import { HubReview } from "../src/hub-review";
@@ -32,8 +33,11 @@ function fixture() {
   let patchDown = false;
   let notifyDown = false;
   let lookupDown = false;
-  let createFailure: "none" | "lost" | "unaccepted" = "none";
+  let createFailure: "none" | "lost" | "unconfirmed" = "none";
+  let createStatus = 201;
   let reviewStatus = 200;
+  let reviewFailure: "none" | "lost" | "timeout" = "none";
+  let reviewUserId: string | undefined;
   let beforeCreate: (() => void) | undefined;
   let beforePatch: (() => void) | undefined;
   let found: Array<Record<string, unknown>> = [];
@@ -58,7 +62,8 @@ function fixture() {
         found = [{ id: 42, source_url: body.source_url, source: "discord_bot", status: "pending" }];
         throw new Error("synthetic lost response");
       }
-      if (createFailure === "unaccepted") return new Response("unavailable", { status: 503 });
+      if (createFailure === "unconfirmed") throw new Error("synthetic connection lost before response");
+      if (createStatus !== 201) return new Response("unavailable", { status: createStatus });
       return Response.json({ id: 42 });
     }
     if (url.pathname === "/api/v1/event-details/42/" && options.method === "PATCH") {
@@ -66,7 +71,13 @@ function fixture() {
       return patchDown ? new Response("unavailable", { status: 503 }) : Response.json({ id: 42 });
     }
     if (url.pathname === "/api/v1/event-details/42/review/") {
-      return reviewStatus === 200 ? Response.json({ status: body.decision }) : new Response("private", { status: reviewStatus });
+      if (reviewFailure === "timeout") throw new Error("synthetic timeout");
+      if (reviewStatus !== 200) return new Response("private", { status: reviewStatus });
+      if (reviewUserId && body.discord_id !== reviewUserId) return new Response("forbidden", { status: 403 });
+      const status = body.decision;
+      found = [{ id: 42, source_url: source.url, source: "discord_bot", status }];
+      if (reviewFailure === "lost") throw new Error("synthetic lost review response");
+      return Response.json({ status });
     }
     throw new Error("Unexpected fake request");
   };
@@ -84,9 +95,9 @@ function fixture() {
     [{ kind: "pdf", url: `https://example.invalid/${id}.pdf` }], { ...source, messageId: id, url: `https://discord.com/channels/100/10/${id}` });
   cleanups.push(() => { deliveries.close(); extracted.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
   return {
-    get settings() { return settings; }, get extracted() { return extracted; }, hub, log, notifications, calls, create, followUp,
+    get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp,
     get review() { return review; }, get deliveries() { return deliveries; }, get createCount() { return createCount; },
-    advance: () => { now += 30000; },
+    advance: (seconds = 30000) => { now += seconds; },
     reopen: () => {
       deliveries.close(); extracted.close(); settings.close();
       settings = new HubStore(path); extracted = new ExtractionStore(path); deliveries = new HubDeliveryStore(path);
@@ -95,6 +106,9 @@ function fixture() {
     setEventsDown: (value: boolean) => { eventsDown = value; }, setPatchDown: (value: boolean) => { patchDown = value; },
     setNotifyDown: (value: boolean) => { notifyDown = value; }, setLookupDown: (value: boolean) => { lookupDown = value; },
     setCreateFailure: (value: typeof createFailure) => { createFailure = value; },
+    setCreateStatus: (value: number) => { createStatus = value; },
+    setReviewFailure: (value: typeof reviewFailure) => { reviewFailure = value; },
+    setReviewUser: (value: string) => { reviewUserId = value; },
     setReviewStatus: (value: number) => { reviewStatus = value; }, setFound: (value: typeof found) => { found = value; },
     beforeCreate: (fn: () => void) => { beforeCreate = fn; }, beforePatch: (fn: () => void) => { beforePatch = fn; },
   };
@@ -149,6 +163,21 @@ test("ハブ停止中は送信待ちを保持し、再起動後の復旧で取�
   expect(f.deliveries.counts()).toMatchObject({ ready: 1, retry: 0 });
 });
 
+for (const status of [400, 403, 404, 409, 429, 500, 503]) test(`作成 POST の ${status} 応答は成否不明にせずバックオフ後に再送する`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateStatus(status);
+  await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "queued", attempts: 1, next_at: 1300 });
+  await f.review.flush(); f.advance(299); await f.review.flush(); expect(f.createCount).toBe(1);
+  f.advance(1); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "queued", attempts: 2, next_at: 1900 });
+  f.reopen(); f.setCreateStatus(201); f.advance(599); await f.review.flush(); expect(f.createCount).toBe(2);
+  f.advance(1); await f.review.flush();
+  expect(f.createCount).toBe(3); expect(f.notifications).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", attempts: 0 });
+  expect(f.extracted.pending(source.messageId)).toBeUndefined();
+  expect(f.calls.some(c => c.path === "/api/v1/event-details/" && c.method === "GET")).toBe(false);
+});
+
 test("作成応答消失後は出典を照合し、POST を重ねず同じ下書きへ復帰する", async () => {
   const f = fixture(); const draft = f.create(); f.setCreateFailure("lost");
   await f.review.flush(); expect(f.deliveries.get(draft.id)?.state).toBe("creating");
@@ -159,7 +188,7 @@ test("作成応答消失後は出典を照合し、POST を重ねず同じ下書
 });
 
 test("成否不明の作成を照合できなければ再作成せず確認対象と記録を残す", async () => {
-  const f = fixture(); const draft = f.create(); f.setCreateFailure("unaccepted"); await f.review.flush();
+  const f = fixture(); const draft = f.create(); f.setCreateFailure("unconfirmed"); await f.review.flush();
   f.reopen(); f.advance(); await f.review.flush(); f.advance(); await f.review.flush();
   expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(0);
   expect(f.extracted.pending(source.messageId)).toMatchObject({ state: "review", reason: "hub_create_unconfirmed" });
@@ -200,6 +229,7 @@ for (const decision of ["approved", "rejected"]) test(`${decision} は押した�
 for (const status of [403, 409]) test(`${status} は押した人に理由を返し、元の通知を変更しない`, async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   const original = JSON.stringify(f.notifications); f.setReviewStatus(status);
+  if (status === 409) f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
   const { i, views } = interaction(draft.id); await f.review.handle(i);
   expect(views[0]!.content).toContain(status === 403 ? "主催者ではありません" : "処理済み");
   expect(JSON.stringify(f.notifications)).toBe(original);
@@ -219,6 +249,62 @@ test("レビューの障害時も押した人と判断を永続化し、復旧�
   f.reopen(); f.setReviewStatus(200); f.advance(); await f.review.flush();
   expect(f.deliveries.get(draft.id)?.state).toBe("closed");
   expect(f.calls.filter(c => c.path.endsWith("/review/")).every(c => c.body?.discord_id === userId)).toBe(true);
+});
+
+for (const failure of ["503", "timeout"] as const) test(`非主催者の ${failure} 後の保留が再起動後も主催者の操作を塞がない`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const ownerId = "223456789012345678"; f.setReviewUser(ownerId);
+  if (failure === "503") f.setReviewStatus(503); else f.setReviewFailure("timeout");
+  await f.review.handle(interaction(draft.id, "rejected").i);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ decision: "rejected", discord_id: userId });
+  const duplicate = interaction(draft.id); await f.review.handle(duplicate.i);
+  expect(duplicate.views[0]!.content).toContain("処理中");
+  f.reopen(); f.setReviewStatus(200); f.setReviewFailure("none");
+  const owner = interaction(draft.id, "approved", "100", ownerId); await f.review.handle(owner.i);
+  expect(owner.views[0]!.content).toContain("承認しました");
+  expect(f.calls.filter(c => c.path.endsWith("/review/")).at(-1)?.body).toEqual({ decision: "approved", discord_id: ownerId });
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved", decision: null });
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(true);
+});
+
+for (const status of ["approved", "rejected"] as const) test(`レビュー応答消失後の 409 は GET の ${status} にローカルを合わせる`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const local = f.settings.drafts("100", 1)[0]!;
+  f.settings.saveDraft({ ...local, approved: status === "rejected" });
+  f.setReviewFailure("lost");
+  await f.review.handle(interaction(draft.id, status).i);
+  expect(f.deliveries.get(draft.id)?.decision).toBe(status);
+  f.reopen(); f.advance(); f.setReviewFailure("none"); f.setReviewStatus(409);
+  await f.review.flush();
+  expect(f.calls.at(-1)).toMatchObject({ method: "GET", path: "/api/v1/event-details/" });
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(status === "approved");
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: status, decision: null });
+  const before = f.calls.length; f.advance(); await f.review.flush(); expect(f.calls).toHaveLength(before);
+});
+
+test("409 の現在状態を取得できなければ確定せず、復旧後に実際の判断へ同期する", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setReviewStatus(409); f.setLookupDown(true);
+  await f.review.handle(interaction(draft.id, "rejected").i);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", decision: "rejected" });
+  f.advance(); f.setLookupDown(false);
+  f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
+  await f.review.flush();
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(true);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
+});
+
+for (const found of [[], [{ id: 43, status: "approved" }], [{ id: 42, status: "pending" }], [{ id: 42 }]])
+test(`409 の照合結果 ${JSON.stringify(found)} ではローカルを確定しない`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(409);
+  f.setFound(found.map(row => ({ ...row, source_url: source.url, source: "discord_bot" })));
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", decision: "approved", reason: "hub_review_retry" });
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(false);
+  f.setFound([{ id: 42, status: "rejected", source_url: source.url, source: "discord_bot" }]);
+  f.advance(); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "rejected", decision: null });
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(false);
 });
 
 test("存在しない・別サーバー・取り外し済みのボタンは外部へ送らず古いと返す", async () => {
@@ -275,6 +361,45 @@ test("受信箱から応募・続報を処理し、本文を消した後も停�
   expect(f.createCount).toBe(1); expect(f.calls.filter(c => c.method === "PATCH")).toHaveLength(2);
 });
 
+test("再接続の履歴補完中に届いた続報は、応募を取り込んでから投稿順に抽出する", async () => {
+  const f = fixture(); const gateway = new FakeGateway();
+  const classified: string[] = [];
+  const judge: Judge = { ask: async (request: JudgeRequest) => {
+    const key = Object.keys(request.questions)[0]!;
+    if (key === "classification") classified.push(request.state);
+    return { [key]: { answer: key === "classification" ? (request.state.includes("続報") ? "follow_up" : "application")
+      : key === "title" ? "line_2" : f.extracted.allDrafts()[0]!.id, confidence: 1 } };
+  } };
+  const pipeline = new HubPipeline(f.settings, f.extracted, gateway, judge, f.hub, f.review);
+  let workTask = Promise.resolve();
+  const work = { run: (ready?: (channelId: string) => boolean) => { workTask = pipeline.run(ready); return workTask; }, review: f.review };
+  const bot = new HubBot(gateway, f.settings, { channelIds: ["10"], work, healthPath: join(f.dir, "health.json"), heartbeatMs: 60000 });
+  let release: () => void = () => {};
+  const recovery = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await bot.start("fake"); await bot.reconcile(); await workTask; await Bun.sleep(0);
+    gateway.events!.disconnected();
+    const application = { ...message("101"), authorId: userId, authorDisplayName: "発表者", sourceUrl: source.url,
+      createdAt: "2026-10-20T00:00:00Z", content: "10/25 に応募\n題名：発表の題名" };
+    gateway.history = [application];
+    gateway.beforeFetch = async () => { await recovery; };
+    gateway.events!.connected();
+    const followUps = ["103", "102"].map(id => ({ ...application, id, sourceUrl: `https://discord.com/channels/100/10/${id}`,
+      content: `続報 スライド https://example.invalid/${id}.pdf` }));
+    for (const item of followUps) gateway.events!.message(item);
+    await Bun.sleep(0); await workTask; await Bun.sleep(0);
+    expect(classified).toEqual([]);
+    expect(f.extracted.pending("102")).toBeUndefined(); expect(f.extracted.pending("103")).toBeUndefined();
+    release(); await bot.reconcile(); await workTask;
+    expect(classified).toEqual([application.content, followUps[1]!.content, followUps[0]!.content]);
+    const drafts = f.extracted.allDrafts(); expect(drafts).toHaveLength(1);
+    expect(drafts[0]!.sources.map(s => s.messageId)).toEqual(["101", "102", "103"]);
+    expect(drafts[0]!.materials.map(m => m.url)).toEqual(["https://example.invalid/102.pdf", "https://example.invalid/103.pdf"]);
+    expect(f.extracted.pending("102")).toBeUndefined(); expect(f.extracted.pending("103")).toBeUndefined();
+    expect(f.settings.messages("10")).toEqual([]); expect(f.createCount).toBe(1);
+  } finally { release(); await bot.stop(); }
+});
+
 test("POST 中・PATCH 中に保存された続報も次の周期で同じ下書きへ送る", async () => {
   const f = fixture(); const draft = f.create();
   f.beforeCreate(() => { f.followUp(draft, "102"); });
@@ -314,7 +439,8 @@ test("同じチャンネルの複数集会は確認対象に残し、導入前�
 test("待機中のレビューが実は処理済みなら 409 で停止し、その後は送らない", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
   await f.review.handle(interaction(draft.id).i);
-  f.reopen(); f.advance(); f.setReviewStatus(409); await f.review.flush();
+  f.reopen(); f.advance(); f.setReviewStatus(409);
+  f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]); await f.review.flush();
   expect(f.deliveries.get(draft.id)?.state).toBe("closed");
   const before = f.calls.length; f.advance(); await f.review.flush(); expect(f.calls).toHaveLength(before);
 });
@@ -329,7 +455,7 @@ test("取り外し後に再設定しても新しい導入境界より前の待�
 });
 
 test("成否不明の保留が後から照合できたら、その保留だけ解消する", async () => {
-  const f = fixture(); f.create(); f.setCreateFailure("unaccepted"); await f.review.flush();
+  const f = fixture(); f.create(); f.setCreateFailure("unconfirmed"); await f.review.flush();
   f.advance(); await f.review.flush(); expect(f.extracted.pending(source.messageId)?.reason).toBe("hub_create_unconfirmed");
   f.setFound([{ id: 42, source: "discord_bot", source_url: source.url, status: "pending" }]);
   f.advance(); await f.review.flush(); expect(f.extracted.pending(source.messageId)).toBeUndefined();
