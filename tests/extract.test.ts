@@ -604,3 +604,16 @@ test("再試行の一括処理は 1 件の例外で止めず、次の投稿へ�
   expect(f.store.pending(b.id)).toBeUndefined();
   expect(f.store.forPresenter("meeting-1", "21")).toHaveLength(1);
 });
+
+test("主催者が無視で閉じた投稿は、受信箱に戻っても判定・下書きにせず ack する", async () => {
+  const f = fixture();
+  const item = post();
+  f.store.reserveReviewNotification(item.id, "guild-1", 1, { type: "dm", userId: "30" });
+  expect(f.store.closeReview(item.id)).toBe(true);
+  f.inbox.save(item);
+  const result = await processInboxMessage(f.extractor, f.inbox, "meeting-1", item);
+  expect(result.status).toBe("unrelated");
+  expect(f.judge.requests).toHaveLength(0);
+  expect(f.store.pending(item.id)).toBeUndefined();
+  expect(f.inbox.messages(item.channelId)).toEqual([]);
+});

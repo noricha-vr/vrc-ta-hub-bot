@@ -323,6 +323,10 @@ export class ExtractionStore {
       targets: rows.map(row => JSON.parse(row.notification) as NotificationTarget) };
   }
 
+  reviewClosed(messageId: string): boolean {
+    return this.db.query("SELECT 1 FROM post_review_notifications WHERE message_id = ? AND closed = 1").get(messageId) !== null;
+  }
+
   unknownReviewNotificationCount(): number {
     return this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM post_review_notifications
       WHERE sending = 1 AND notified = 0 AND closed = 0`).get()!.n;
