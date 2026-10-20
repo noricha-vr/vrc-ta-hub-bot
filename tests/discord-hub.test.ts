@@ -268,6 +268,9 @@ test(`${target.type} の直近履歴から自分の nonce または通知ボタ�
       historyAllowed = true; guildId = "200"; await expect(find()).rejects.toThrow("Invalid notification channel");
       guildId = "100";
     }
+    messages = [own(null, buttonId)];
+    expect(await gateway.findNotification("100", target, "old-nonce", buttonId))
+      .toEqual({ channelId: channel.id, messageId: "501" });
     historyDown = true; await expect(find()).rejects.toThrow("Synthetic history failure");
   } finally { await gateway.stop(); }
 });
@@ -353,5 +356,49 @@ test("確認待ちの無視はリンクを含む全ボタンを外し、編集�
       expect(edit.components).toEqual([]);
       expect(edit.allowedMentions).toEqual({ parse: [], repliedUser: false });
     }
+  } finally { await gateway.stop(); }
+});
+for (const channelType of [ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.DM])
+for (const result of ["", "承認済み（運営）", "却下（運営）"])
+test(`続報の通知本文だけを更新しボタン・結果・埋め込み抑制を保つ: ${channelType} ${result}`, async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  let content = `元の通知${result ? `\n${result}` : ""}`;
+  const edits: Record<string, unknown>[] = [];
+  client.channels.fetch = (async () => ({ type: channelType, messages: { fetch: async () => ({
+    author: { id: "20" }, content, edit: async (payload: Record<string, unknown>) => {
+      edits.push(payload); content = payload.content as string;
+    },
+  }) } })) as unknown as typeof client.channels.fetch;
+  try {
+    const view = { content: "最新の通知\n資料：https://example.invalid/slides", controls: [] };
+    await gateway.updateNotification({ channelId: "11", messageId: "501" }, view);
+    await gateway.updateNotification({ channelId: "11", messageId: "501" }, view);
+    expect(content).toBe(`${view.content}${result ? `\n${result}` : ""}`);
+    for (const edit of edits) {
+      // components を送らないことで、既存のボタンを変更しない。
+      expect(edit).not.toHaveProperty("components");
+      expect(edit.allowedMentions).toEqual({ parse: [], repliedUser: false });
+      expect(edit.flags).toBe(MessageFlags.SuppressEmbeds);
+    }
+  } finally { await gateway.stop(); }
+});
+
+test("続報の編集でも自分の通知以外は変更せず、削除済みチャンネルを終了できる", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  let edits = 0;
+  const view = { content: "最新の通知", controls: [] };
+  client.channels.fetch = (async () => ({ type: ChannelType.GuildText, messages: { fetch: async () => ({
+    author: { id: "30" }, edit: async () => { edits++; },
+  }) } })) as unknown as typeof client.channels.fetch;
+  try {
+    await expect(gateway.updateNotification({ channelId: "11", messageId: "501" }, view)).rejects.toThrow("this bot");
+    expect(edits).toBe(0);
+    client.channels.fetch = (async () => null) as unknown as typeof client.channels.fetch;
+    await expect(gateway.updateNotification({ channelId: "11", messageId: "501" }, view))
+      .rejects.toMatchObject({ code: 10003, status: 404 });
   } finally { await gateway.stop(); }
 });

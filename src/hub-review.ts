@@ -11,6 +11,8 @@ import type { NotificationReference } from "./gateway";
 
 export interface HubReviewGateway {
   notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<NotificationReference>;
+  updateNotification(reference: NotificationReference, view: HubView): Promise<void>;
+  findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string, attemptedAt?: number): Promise<NotificationReference | false | "unknown">;
   editNotification(reference: NotificationReference, result: string, removeLinks?: boolean): Promise<void>;
 }
 const text = (content: string): HubView => ({ content, controls: [] });
@@ -138,13 +140,26 @@ export class HubReview {
   private async updateNotifications(id: string): Promise<void> {
     const row = this.deliveries.get(id);
     if (!row || !this.setting(row)) return;
+    const setting = this.setting(row)!;
+    const draft = this.extracted.get(id)!;
+    const closed = row.state === "closed" && ["approved", "rejected"].includes(row.reason);
+    // 未同期の続報を表示して、同期済みと記録しない。
+    if (!closed && row.synced_hash !== fingerprint(draft)) return;
     const name = discordText(row.reviewer_display_name);
     const result = `${row.reason === "approved" ? "承認済み" : "却下"}${name ? `（${name}）` : ""}`;
     for (const pending of this.deliveries.dueNotifications(this.now(), id)) {
+      if (!closed && !this.matchesTarget(pending, setting)) continue;
       try {
-        await this.gateway.editNotification({ channelId: pending.channel_id, messageId: pending.message_id }, result);
-        this.deliveries.notificationEdited(pending);
-        this.log("hub_review_notification_edited");
+        const reference = { channelId: pending.channel_id, messageId: pending.message_id };
+        if (closed) {
+          await this.gateway.editNotification(reference, result);
+          this.deliveries.notificationEdited(pending);
+          this.log("hub_review_notification_edited");
+        } else {
+          await this.gateway.updateNotification(reference, this.notificationView(row, draft, setting));
+          this.deliveries.notificationUpdated(pending, row.synced_hash);
+          this.log("hub_review_notification_updated");
+        }
       } catch (error) {
         const { code, status } = error && typeof error === "object"
           ? error as { code?: unknown; status?: unknown } : {};
@@ -172,6 +187,8 @@ export class HubReview {
     let row = this.deliveries.get(id);
     if (!row || !this.setting(row)) return;
     if (row.state === "closed") { await this.syncClosed(id); return; }
+    // 旧記録で送達先が未確定の ready も、再送前に照合する。
+    const unconfirmed = row.state === "ready" && !this.deliveries.notifications(id).length;
     const draft = this.extracted.get(id);
     if (!draft) return;
     // 送信済みなら同じ出典で照合する。旧形式の作成は先頭の出典を使っていた。
@@ -228,19 +245,56 @@ export class HubReview {
     const setting = this.setting(row);
     if (!setting || row.state !== "ready") return;
     const notificationHash = fingerprint([row.synced_hash, setting.notification]);
+    // 終了した通知も送達済みとして扱い、削除後に新しく送り直さない。
+    if (this.deliveries.notifications(id).some(n => this.matchesTarget(n, setting))) return;
     if (row.notified_hash !== notificationHash) {
-      const view: HubView = {
-        content: `承認待ちの発表があります。\n日付：${eventDateLabel(draft.eventDate)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\nテーマ：${discordText(draft.title).slice(0, 300)}\n${sourceFor(draft, setting.guildId)}`,
-        controls: [{ type: "buttons", buttons: [
-          { id: `hub-review:${row.draft_id}:approved`, label: "承認" },
-          { url: this.hub.editUrl(row.hub_id!), label: "直す" },
-          { id: `hub-review:${row.draft_id}:rejected`, label: "却下" },
-        ] }],
-      };
-      const reference = await this.gateway.notify(setting.guildId, setting.notification, view, fingerprint([row.draft_id, notificationHash]).slice(0, 24));
-      this.deliveries.notified(row.draft_id, notificationHash, reference);
-      this.log("hub_review_notified");
+      const view = this.notificationView(row, draft, setting);
+      const targetKey = this.targetKey(setting);
+      // 続報や再起動で送信の識別子を変えず、成否不明の通知を照合してから送る。
+      const nonce = fingerprint([row.draft_id, targetKey]).slice(0, 24);
+      const found = row.notification_target === targetKey || (unconfirmed && !row.notification_target)
+        ? await this.gateway.findNotification(setting.guildId, setting.notification, nonce, `hub-review:${id}:approved`, row.notification_attempted_at * 1000)
+        : false;
+      if (found === "unknown") {
+        this.log("hub_review_notification_unknown");
+        throw new Error("Notification delivery unconfirmed");
+      }
+      this.deliveries.reserveNotification(id, targetKey, this.now());
+      const reference = found || await this.gateway.notify(setting.guildId, setting.notification, view, nonce);
+      this.deliveries.notified(row.draft_id, notificationHash, reference, targetKey, !!found);
+      this.log(found ? "hub_review_notification_recovered" : "hub_review_notified");
     }
+  }
+
+  private targetKey(setting: HubSetting): string {
+    return fingerprint([setting.guildId, setting.notification]);
+  }
+
+  private matchesTarget(notification: { target_key: string; channel_id: string }, setting: HubSetting): boolean {
+    if (notification.target_key) return notification.target_key === this.targetKey(setting);
+    // 旧記録には宛先キーがない。チャンネルは ID で照合できるが、DM は照合できないので編集せず送り直す。
+    return setting.notification.type !== "dm" && notification.channel_id === setting.notification.channelId;
+  }
+
+  private notificationView(row: HubDelivery, draft: TalkDraft, setting: HubSetting): HubView {
+    const materials = draft.materials.flatMap(m => {
+      const url = httpUrl(m.url);
+      // メンションと Markdown の記号を百分率符号化し、文字どおりの URL として表示する。
+      return url ? [url.replace(/[@<>*_~|`\\[\]()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)] : [];
+    });
+    // 長すぎる URL は通知の上限（2,000 文字）を超えるので出さず、件数だけ書く。
+    const shown = materials.find(url => url.length <= 500);
+    const others = materials.length - (shown ? 1 : 0);
+    const materialLine = !materials.length ? ""
+      : shown ? `\n資料：${shown}${others ? ` ほか ${others} 件` : ""}` : `\n資料：${materials.length} 件（URL が長いため Hub で確認）`;
+    return {
+      content: `承認待ちの発表があります。\n日付：${eventDateLabel(draft.eventDate)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\nテーマ：${discordText(draft.title).slice(0, 300)}${materialLine}\n${sourceFor(draft, setting.guildId)}`,
+      controls: [{ type: "buttons", buttons: [
+        { id: `hub-review:${row.draft_id}:approved`, label: "承認" },
+        { url: this.hub.editUrl(row.hub_id!), label: "直す" },
+        { id: `hub-review:${row.draft_id}:rejected`, label: "却下" },
+      ] }],
+    };
   }
 
   private async sync(row: HubDelivery, draft: TalkDraft): Promise<void> {

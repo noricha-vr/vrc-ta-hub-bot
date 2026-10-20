@@ -132,7 +132,7 @@ export class DiscordGateway implements Gateway {
     return { channelId: message.channelId, messageId: message.id };
   }
 
-  async editNotification(reference: NotificationReference, result: string, removeLinks = false): Promise<void> {
+  private async notificationMessage(reference: NotificationReference) {
     const channel = await this.client.channels.fetch(reference.channelId);
     if (!channel) throw Object.assign(new Error("Unknown notification channel"), { code: 10003, status: 404 });
     if (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
@@ -140,6 +140,19 @@ export class DiscordGateway implements Gateway {
     }
     const message = await channel.messages.fetch({ message: reference.messageId, cache: false });
     if (message.author.id !== this.client.user?.id) throw new Error("Notification must belong to this bot");
+    return message;
+  }
+
+  async updateNotification(reference: NotificationReference, view: HubView): Promise<void> {
+    const message = await this.notificationMessage(reference);
+    const result = /\n(?:承認済み|却下)(?:（[^\r\n]*）)?$/.exec(message.content)?.[0] ?? "";
+    // 本文だけを更新し、今のボタンと確定済みの結果を保持する。
+    await message.edit({ content: `${view.content}${result}`,
+      allowedMentions: { parse: [], repliedUser: false }, flags: MessageFlags.SuppressEmbeds });
+  }
+
+  async editNotification(reference: NotificationReference, result: string, removeLinks = false): Promise<void> {
+    const message = await this.notificationMessage(reference);
     const components = removeLinks ? [] : message.components.flatMap(row => {
       if (!("components" in row)) return [];
       const links = row.components.flatMap(component => component.type === ComponentType.Button && component.style === ButtonStyle.Link
