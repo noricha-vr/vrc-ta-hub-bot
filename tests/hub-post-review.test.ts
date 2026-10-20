@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelType, Client } from "discord.js";
+import type { NotificationReference } from "../src/gateway";
 import { HubBot } from "../src/bot";
 import { clientOptions, DiscordGateway } from "../src/discord-gateway";
 import { ExtractionStore } from "../src/extraction-store";
@@ -32,6 +33,8 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   const gateway = new FakeGateway();
   const notices: Array<{ guildId: string; target: NotificationTarget; view: HubView; nonce: string }> = [];
   const logs: string[] = [];
+  const edits: Array<{ reference: NotificationReference; result: string; removeLinks: boolean | undefined }> = [];
+  let editError: unknown;
   let memberships: HubCommunity[] = [community];
   let failLookup = false;
   let failNotify = false;
@@ -48,10 +51,14 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     if (url.pathname === "/api/v1/event/") return Response.json([]);
     throw new Error("Unexpected fake Hub request");
   });
-  const notifier: HubPostReviewGateway = { editNotification: async () => {}, findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
+  const notifier: HubPostReviewGateway = { editNotification: async (reference, result, removeLinks) => {
+    edits.push({ reference, result, removeLinks });
+    if (editError) throw editError;
+  }, findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
     lookups.push(target);
     if (failFind) throw new Error("secret response body");
-    return notices.some(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
+    const index = notices.findIndex(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
+    return index < 0 ? false : { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(501 + index) };
   }, notify: async (guildId: string, target: NotificationTarget, view: HubView, nonce: string) => {
     beforeNotify?.(nonce);
     if (failNotify) throw new Error("secret response body");
@@ -66,16 +73,17 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   const hold = (reason = "title_unextracted", id = "101", meetingId = "1", url = `https://discord.com/channels/100/10/${id}`) => {
     extracted.holdReview(meetingId, userId, { messageId: id, channelId: "10", url }, reason, 1000);
   };
-  const act = async (id = "101", guildId: string | null = "100", actor = userId) => {
+  const act = async (id = "101", guildId: string | null = "100", actor = userId, extra: Partial<HubInteraction> = {}) => {
     const views: HubView[] = [];
     let deferred = false;
     await review.handle({ action: `hub-review:${id}:ignore`, guildId, userId: actor, kind: "component", values: [],
       defer: async () => { deferred = true; }, edit: async view => { expect(deferred).toBe(true); views.push(view); },
-      followUp: async () => {} });
+      followUp: async () => {}, ...extra });
     return views[0]!.content;
   };
   cleanups.push(() => { extracted.close(); deliveries.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups, notifier,
+  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups, notifier, edits,
+    setEditError: (error: unknown) => { editError = error; },
     get extracted() { return extracted; }, get review() { return review; },
     reopen: () => { extracted.close(); extracted = new ExtractionStore(path); review = makeReview(); },
     advance: (ms: number) => { now += ms; },
@@ -94,7 +102,7 @@ test(`確認待ちを ${target.type} へ一度だけ通知し、再起動後も�
   await Promise.all([f.review.flush(), f.review.flush()]); await f.review.flush();
   expect(f.notices).toHaveLength(2);
   expect(f.notices[0]).toMatchObject({ guildId: "100", target,
-    view: { content: "https://discord.com/channels/100/10/101\n理由：題名を読み取れません。" } });
+    view: { content: "確認が必要な投稿があります。\nhttps://discord.com/channels/100/10/101\n理由：題名を読み取れません。" } });
   expect(f.notices[1]!.view.content).toContain("開催日が決まりません");
   expect(new Set(f.notices.map(n => n.nonce)).size).toBe(2);
   const payload = discordHubView(f.notices[0]!.view);
@@ -123,6 +131,9 @@ test(`${target.type} への送信成功後、保存前に停止しても履歴�
   expect(f.notices).toHaveLength(1);
   expect(f.extracted.reviewNotification("101")?.notified).toBe(1);
   expect(f.logs).toContain("hub_post_review_notification_recovered");
+  await f.act();
+  expect(f.edits).toEqual([{ reference: { channelId: target.type === "dm" ? "900" : "11", messageId: "501" },
+    result: "無視", removeLinks: true }]);
 });
 
 test("照合できるまでは再送せず、他の確認待ちを通知できる", async () => {
@@ -187,7 +198,7 @@ test("既存の通知テーブルに送信中の列を追加しても送信済�
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("実際の抽出経路の確認待ちから本文を消し、リンクと理由だけを通知・保存する", async () => {
+test("実際の抽出経路の確認待ちから本文を消し、投稿者・リンク・理由を通知し、本文を保存しない", async () => {
   const f = fixture();
   const content = "本文固有の文字列 @everyone <@123456789012345678>";
   f.settings.save({ ...message("101"), authorId: userId, authorDisplayName: "秘密の表示名", content,
@@ -203,7 +214,9 @@ test("実際の抽出経路の確認待ちから本文を消し、リンクと�
     const rows = db.query("SELECT * FROM pending_posts").all();
     const notifications = db.query("SELECT * FROM post_review_notifications").all();
     const result = JSON.stringify([f.notices, f.logs, rows, notifications]);
-    expect(result).not.toContain(content); expect(result).not.toContain("秘密の表示名");
+    expect(result).not.toContain(content);
+    expect(f.notices[0]!.view.content.split("\n").slice(0, 2)).toEqual(["確認が必要な投稿があります。", "投稿者：秘密の表示名"]);
+    expect(f.logs.join()).not.toContain("秘密の表示名");
     expect(result).not.toContain("@everyone"); expect(result).not.toContain("synthetic");
   } finally { db.close(); }
 });
@@ -274,7 +287,7 @@ test("通知失敗は次の周期で再試行し、他の確認待ちや受信�
     { ask: async () => ({ classification: { answer: "application", confidence: 0.1 } }) }, f.hub, f.review);
   await pipeline.run();
   expect(f.notices).toHaveLength(2);
-  expect(f.notices.map(n => n.view.content.split("\n")[0])).toEqual([
+  expect(f.notices.map(n => n.view.content.split("\n").find(line => line.startsWith("https://discord.com/channels/")))).toEqual([
     "https://discord.com/channels/100/10/102", "https://discord.com/channels/100/10/103",
   ]);
   expect(f.settings.messages("10")).toEqual([]);
@@ -349,7 +362,7 @@ function notificationHistory(f: ReturnType<typeof fixture>, foundOnPage?: number
   Object.defineProperty(client, "user", { value: { id: "20" } });
   const queries: Array<{ before?: string; limit: number; cache: boolean }> = [];
   client.channels.fetch = (async () => ({
-    type: ChannelType.GuildText, guildId: "100", guild: { members: { me: { id: "20" } } },
+    id: "11", type: ChannelType.GuildText, guildId: "100", guild: { members: { me: { id: "20" } } },
     permissionsFor: () => ({ has: () => true }),
     messages: { fetch: async (query: typeof queries[number]) => {
       queries.push(query);
@@ -381,6 +394,8 @@ test("送信済み通知が履歴の 2 ページ目にあれば再起動後も�
   expect(queries).toEqual([{ limit: 100, cache: false }, { limit: 100, cache: false, before: "99901" }]);
   expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, sending: 0 });
   expect(f.extracted.reviewNotification("101")!.attempted_at).toBeGreaterThanOrEqual(before);
+  await f.act();
+  expect(f.edits[0]?.reference).toEqual({ channelId: "11", messageId: "99900" });
 });
 
 test("履歴の 20 ページ上限で見つからない時は再送せず成否不明を健康状態に残す", async () => {
@@ -512,7 +527,7 @@ test(`成否不明の照合が ${found} になれば待機間隔を消す`, asyn
   let calls = 0;
   f.notifier.findNotification = async () => { calls++; return "unknown"; };
   await f.review.flush();
-  f.notifier.findNotification = async () => { calls++; return found; };
+  f.notifier.findNotification = async () => { calls++; return found ? { channelId: "11", messageId: "501" } : false; };
   await f.review.flush(); expect(calls).toBe(1);
   f.advance(60000); await f.review.flush();
   expect(calls).toBe(2);
@@ -572,4 +587,114 @@ test("無視時の保留行削除が失敗したら tombstone の更新もロー
     expect(await f.act()).toContain("閉じました");
     expect(f.extracted.pending("101")).toBeUndefined();
   } finally { db.close(); }
+});
+
+
+test("投稿者の表示名を再起動後も表示し、メンションと Markdown を無効にする", async () => {
+  const f = fixture();
+  f.extracted.holdReview("1", userId, { messageId: "101", channelId: "10", url: "https://discord.com/channels/100/10/101" },
+    "uncertain", 1000, "**運営** @everyone <@123>\n[表示](https://example.invalid)");
+  f.reopen(); await f.review.flush();
+  const content = f.notices[0]!.view.content;
+  expect(content.split("\n")).toEqual([
+    "確認が必要な投稿があります。",
+    "投稿者：\\*\\*運営\\*\\* ＠everyone \\<＠123\\> \\[表示\\]\\(https://example.invalid\\)",
+    "https://discord.com/channels/100/10/101", "理由：応募か続報かを確信を持って判断できません。",
+  ]);
+  expect(discordHubView(f.notices[0]!.view).allowedMentions).toEqual({ parse: [], repliedUser: false });
+});
+
+for (const target of [{ type: "channel", channelId: "11" }, { type: "dm", userId }] as const)
+test(`無視すると ${target.type} の元通知を編集し、全ボタンを外して安全な表示名を足す`, async () => {
+  const f = fixture(target); f.hold(); await f.review.flush();
+  expect(await f.act("101", target.type === "dm" ? null : "100", userId,
+    { userDisplayName: "**運営** @everyone\n<@123>" })).toContain("閉じました");
+  expect(f.edits).toEqual([{ reference: { channelId: target.type === "dm" ? "900" : "11", messageId: "501" },
+    result: "無視（\\*\\*運営\\*\\* ＠everyone \\<＠123\\>）", removeLinks: true }]);
+  expect(f.logs).toContain("hub_post_review_notification_edited");
+  f.reopen(); await f.review.flush(); expect(f.edits).toHaveLength(1);
+});
+
+test("無視の通知編集に失敗しても閉じた記録を残し、再起動後に間隔を倍増して編集し直す", async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  f.setEditError(new Error("private edit response"));
+  expect(await f.act("101", "100", userId, { userDisplayName: "運営" })).toContain("閉じました");
+  expect(f.extracted.pending("101")).toBeUndefined();
+  expect(f.extracted.reviewNotification("101")?.closed).toBe(1);
+  expect(f.edits).toHaveLength(1);
+  f.reopen(); f.advance(299999); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.reopen(); f.setEditError(undefined); f.advance(599999); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.edits[2]?.result).toBe("無視（運営）");
+  f.advance(21600000); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.notices).toHaveLength(1);
+  expect(f.logs).toContain("hub_post_review_notification_retry");
+  expect(f.logs.join()).not.toContain("private edit response");
+});
+
+for (const [error, reason] of [
+  [{ code: 10008 }, "unknown_message"], [{ code: 10003 }, "unknown_channel"], [{ status: 404 }, "not_found"],
+] as const)
+test(`無視した通知の ${reason} は再起動後も再試行しない`, async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  f.setEditError(Object.assign(new Error("private missing response"), error));
+  await f.act(); expect(f.edits).toHaveLength(1);
+  expect(f.logs).toContain(`hub_post_review_notification_${reason}`);
+  f.reopen(); f.advance(21600000); await f.review.flush(); await f.act();
+  expect(f.edits).toHaveLength(1);
+  expect(f.extracted.reviewNotification("101")?.closed).toBe(1);
+});
+
+test("旧通知に編集先 ID がなくても押された通知から補って編集する", async () => {
+  const f = fixture(); f.hold();
+  f.extracted.reserveReviewNotification("101", "100", 1, { type: "channel", channelId: "11" });
+  f.extracted.markReviewNotified("101");
+  await f.act("101", "100", userId, { notification: { channelId: "11", messageId: "499" } });
+  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "499" }, result: "無視", removeLinks: true }]);
+});
+
+
+for (const error of [{ status: 403 }, { code: 50001 }, { code: 50013 }])
+test(`無視通知の権限不足 ${JSON.stringify(error)} は再起動後も 6 時間待つ`, async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  f.setEditError(Object.assign(new Error("private forbidden response"), error));
+  await f.act(); expect(f.edits).toHaveLength(1);
+  expect(f.logs).toContain("hub_post_review_notification_forbidden");
+  f.reopen(); f.advance(21599999); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.setEditError(undefined); f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
+});
+
+test("再試行の記録から元投稿が消えて確認待ちになっても投稿者を表示する", async () => {
+  const f = fixture();
+  f.settings.save({ ...message("101"), authorId: userId, authorDisplayName: "投稿者", content: "応募の本文",
+    sourceUrl: "https://discord.com/channels/100/10/101" });
+  let now = 1000;
+  const pipeline = new HubPipeline(f.settings, f.extracted, f.gateway,
+    { ask: async () => { throw new Error("Synthetic judge failure"); } }, f.hub, f.review, undefined, () => now);
+  await pipeline.run();
+  expect(f.extracted.pending("101")).toMatchObject({ state: "retry", authorDisplayName: "投稿者" });
+  expect(f.settings.purge(23 * 3600, Math.floor(Date.now() / 1000) + 24 * 3600)).toBe(1);
+  expect(f.settings.messages("10")).toEqual([]);
+  f.reopen(); now += 300;
+  // Gateway の偽物に元の投稿は無いので、確認待ちへ移る。
+  const restarted = new HubPipeline(f.settings, f.extracted, f.gateway,
+    { ask: async () => { throw new Error("Unexpected judge call"); } }, f.hub, f.review, undefined, () => now);
+  await restarted.run();
+  expect(f.notices[0]!.view.content).toContain("投稿者：投稿者\n");
+  expect(f.notices[0]!.view.content).toContain("元の投稿を取り直せません");
+  expect(JSON.stringify(f.notices)).not.toContain("応募の本文");
+});
+
+test("複数集会の確認待ちにも投稿者の表示名を引き継ぐ", async () => {
+  const f = fixture();
+  f.settings.configure({ guildId: "100", community: { ...community, id: 2 }, channelIds: ["10"],
+    notification: { type: "channel", channelId: "11" } }, "100");
+  f.settings.save({ ...message("101"), authorId: userId, authorDisplayName: "投稿者", content: "応募の本文",
+    sourceUrl: "https://discord.com/channels/100/10/101" });
+  const pipeline = new HubPipeline(f.settings, f.extracted, f.gateway,
+    { ask: async () => { throw new Error("Unexpected judge call"); } }, f.hub, f.review);
+  await pipeline.run();
+  expect(f.notices[0]!.view.content).toContain("投稿者：投稿者\n");
+  expect(f.notices[0]!.view.content).toContain("登録先の集会を決められません");
 });

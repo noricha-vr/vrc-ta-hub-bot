@@ -132,7 +132,7 @@ export class DiscordGateway implements Gateway {
     return { channelId: message.channelId, messageId: message.id };
   }
 
-  async editNotification(reference: NotificationReference, result: string): Promise<void> {
+  async editNotification(reference: NotificationReference, result: string, removeLinks = false): Promise<void> {
     const channel = await this.client.channels.fetch(reference.channelId);
     if (!channel) throw Object.assign(new Error("Unknown notification channel"), { code: 10003, status: 404 });
     if (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
@@ -140,21 +140,21 @@ export class DiscordGateway implements Gateway {
     }
     const message = await channel.messages.fetch({ message: reference.messageId, cache: false });
     if (message.author.id !== this.client.user?.id) throw new Error("Notification must belong to this bot");
-    const components = message.components.flatMap(row => {
+    const components = removeLinks ? [] : message.components.flatMap(row => {
       if (!("components" in row)) return [];
       const links = row.components.flatMap(component => component.type === ComponentType.Button && component.style === ButtonStyle.Link
         ? [ButtonBuilder.from(component)] : []);
       return links.length ? [new ActionRowBuilder<ButtonBuilder>().addComponents(links)] : [];
     });
     // 応答を失った編集の再試行でも結果行は一つにする。
-    const content = message.content.replace(/\n(?:承認済み|却下)(?:（[^\r\n]*）)?$/, "");
+    const content = message.content.replace(/\n(?:承認済み|却下|無視)(?:（[^\r\n]*）)?$/, "");
     await message.edit({ content: `${content}\n${result}`, components,
       allowedMentions: { parse: [], repliedUser: false }, flags: MessageFlags.SuppressEmbeds });
   }
 
   /** SDK のキャッシュや短時間の nonce 重複排除に頼らず、自分の通知を照合する。 */
   async findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string,
-    attemptedAt = 0): Promise<boolean | "unknown"> {
+    attemptedAt = 0): Promise<NotificationReference | false | "unknown"> {
     const channel = target.type === "dm"
       ? await (await this.client.users.fetch(target.userId)).createDM()
       : await this.client.channels.fetch(target.channelId);
@@ -173,9 +173,10 @@ export class DiscordGateway implements Gateway {
     let before: string | undefined;
     for (let page = 0; page < NOTIFICATION_HISTORY_PAGES; page++) {
       const messages = [...(await channel.messages.fetch({ limit: 100, cache: false, ...(before ? { before } : {}) })).values()];
-      if (messages.some(message => message.author.id === this.client.user?.id
+      const found = messages.find(message => message.author.id === this.client.user?.id
         && (message.nonce === nonce || message.components.some(row => "components" in row
-          && row.components.some(component => "customId" in component && component.customId === buttonId))))) return true;
+          && row.components.some(component => "customId" in component && component.customId === buttonId))));
+      if (found) return { channelId: channel.id, messageId: found.id };
       // 全履歴を読み切れた場合と、送信を試みた時刻より前まで遡れた場合は未送信とする。ページ数の上限は未送信の証拠にしない。
       if (messages.length < 100) return false;
       const oldest = messages.reduce((a, b) => BigInt(a.id) < BigInt(b.id) ? a : b);

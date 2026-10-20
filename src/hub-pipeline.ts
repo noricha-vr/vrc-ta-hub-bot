@@ -45,7 +45,7 @@ export class HubPipeline {
         // 同じ投稿から複数集会へ自動で同じ下書きを登録しない。
         if (settings.length !== 1) {
           this.extractor.store.holdReview("", message.authorId, { messageId: message.id, channelId,
-            url: message.sourceUrl ?? "" }, "multiple_communities", this.now());
+            url: message.sourceUrl ?? "" }, "multiple_communities", this.now(), message.authorDisplayName);
           this.inbox.ack(channelId, message.id);
           this.log("hub_extraction_ambiguous_community");
           continue;

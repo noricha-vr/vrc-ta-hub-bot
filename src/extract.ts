@@ -246,9 +246,9 @@ function holdForReview(store: ExtractionStore, inbox: Inbox, source: PostReferen
  */
 function recordRetry(
   store: ExtractionStore, inbox: Inbox, meetingId: string, authorId: string,
-  source: PostReference, reason: string, now: number,
+  source: PostReference, reason: string, now: number, authorDisplayName = "",
 ): "retry" | ExtractionResult {
-  const attempts = store.scheduleRetry(meetingId, authorId, source, reason, retryDelaySeconds, now);
+  const attempts = store.scheduleRetry(meetingId, authorId, source, reason, retryDelaySeconds, now, authorDisplayName);
   return attempts < MAX_RETRY_ATTEMPTS ? "retry" : holdForReview(store, inbox, source, "retry_exhausted");
 }
 
@@ -262,7 +262,7 @@ function settle(
 ): ExtractionResult {
   const store = extractor.store;
   if (result.status === "review") {
-    store.holdReview(meetingId, message.authorId, result.source, result.reason, now);
+    store.holdReview(meetingId, message.authorId, result.source, result.reason, now, message.authorDisplayName);
     inbox.ack(message.channelId, message.id);
     return result;
   }
@@ -272,7 +272,7 @@ function settle(
     return result;
   }
   try {
-    const recorded = recordRetry(store, inbox, meetingId, message.authorId, result.source, result.reason, now);
+    const recorded = recordRetry(store, inbox, meetingId, message.authorId, result.source, result.reason, now, message.authorDisplayName);
     if (recorded === "retry") return result;
     extractor.recount("retry", recorded.status);
     return recorded;
@@ -316,7 +316,7 @@ async function refetch(gateway: Pick<Gateway, "fetchMessages">, pending: Pending
 /** 取り直せなかった投稿の扱い。一時的な障害は回数の内で再試行し、投稿が無ければ確認対象にする。 */
 function unrefetched(store: ExtractionStore, inbox: Inbox, pending: PendingPost, kind: "missing" | "unavailable", now: number): ExtractionResult {
   if (kind === "missing") return holdForReview(store, inbox, pending.source, "refetch_failed");
-  const recorded = recordRetry(store, inbox, pending.meetingId, pending.authorId, pending.source, "refetch_unavailable", now);
+  const recorded = recordRetry(store, inbox, pending.meetingId, pending.authorId, pending.source, "refetch_unavailable", now, pending.authorDisplayName);
   return recorded === "retry" ? { status: "retry", reason: "refetch_unavailable", source: pending.source } : recorded;
 }
 
