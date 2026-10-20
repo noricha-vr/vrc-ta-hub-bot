@@ -1,5 +1,10 @@
 import type { HubInteraction } from "./hub-setup";
 
+export interface NotificationReference {
+  channelId: string;
+  messageId: string;
+}
+
 export interface GatewayAttachment {
   url: string;
   name: string;

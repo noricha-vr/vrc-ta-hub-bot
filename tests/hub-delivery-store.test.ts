@@ -87,6 +87,32 @@ test("操作者別の旧 DB には開始時刻を補い、件数と待ち時間�
   } finally { store.close(); }
 });
 
+test("旧通知の編集待ちを保って終了理由の列を追加し、終了状態を再起動後も保持する", () => {
+  const path = databasePath();
+  const legacy = new Database(path);
+  legacy.exec(`CREATE TABLE hub_review_notifications (
+    draft_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+    edited INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel_id, message_id)
+  );
+  INSERT INTO hub_review_notifications VALUES ('draft', '11', '501', 0, 2, 1600);`);
+  legacy.close();
+  let store = new HubDeliveryStore(path);
+  try {
+    store.enqueue("draft", "100", 1); store.closed("draft", "approved");
+    expect(store.dueNotifications(1599)).toEqual([]);
+    const pending = store.dueNotifications(1600)[0]!;
+    expect(pending).toMatchObject({ attempts: 2, next_at: 1600, edited: 0, closed_reason: "" });
+    expect(store.counts().retry).toBe(1);
+    store.close(); store = new HubDeliveryStore(path);
+    expect(store.dueNotifications(1600)).toEqual([pending]);
+    store.notificationClosed(pending, "unknown_message");
+    store.close(); store = new HubDeliveryStore(path);
+    expect(store.dueNotifications(Number.MAX_SAFE_INTEGER)).toEqual([]);
+    expect(store.counts().retry).toBe(0);
+  } finally { store.close(); }
+});
+
 test("未確認者の上限と再送の 5 件枠は下書きごとに持ち、主催者の実績はサーバーと集会で分ける", () => {
   const store = new HubDeliveryStore(databasePath());
   try {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { HubCommunity, HubLookup } from "./hub-api";
 import { HubStore, type NotificationTarget } from "./hub-store";
 import type { HubReview } from "./hub-review";
+import type { NotificationReference } from "./gateway";
 
 export type HubControl =
   | { type: "select"; id: string; options: Array<{ label: string; value: string }> }
@@ -11,6 +12,8 @@ export interface HubView { content: string; controls: HubControl[] }
 export interface HubInteraction {
   guildId: string | null;
   userId: string;
+  userDisplayName?: string;
+  notification?: NotificationReference;
   kind: "command" | "component";
   action: string;
   values: string[];
@@ -39,6 +42,11 @@ interface Session {
 }
 const text = (content: string): HubView => ({ content, controls: [] });
 class StaleMenuError extends Error {}
+export class HubNotificationPermissionError extends Error {
+  constructor() {
+    super("通知先で Bot に「チャンネルを見る」「メッセージを送信」「メッセージ履歴を読む」権限が必要です。権限を確認して、/hub setup からやり直してください。");
+  }
+}
 const plainName = (name: string) => name.replace(/[\r\n<@]/g, " ").slice(0, 80);
 const safeName = (name: string) => plainName(name).replace(/[\\[\]()*_~`|>#]/g, "\\$&");
 /** Upper snowflake bound at setup time; even an empty channel never starts at zero. */
@@ -67,9 +75,10 @@ export class HubSetup {
       for (const [token, session] of this.sessions) if (session.expires <= this.now()) this.sessions.delete(token);
       if (interaction.kind === "command") await this.command(interaction);
       else await this.component(interaction);
-    } catch {
+    } catch (error) {
       this.log("hub_command_failed");
-      try { await interaction.edit(text("処理に失敗しました。権限や接続を確認して、/hub からやり直してください。")); } catch { /* no raw SDK errors */ }
+      try { await interaction.edit(text(error instanceof HubNotificationPermissionError ? error.message
+        : "処理に失敗しました。権限や接続を確認して、/hub からやり直してください。")); } catch { /* no raw SDK errors */ }
     }
   }
 

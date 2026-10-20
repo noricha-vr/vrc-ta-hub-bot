@@ -48,7 +48,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     if (url.pathname === "/api/v1/event/") return Response.json([]);
     throw new Error("Unexpected fake Hub request");
   });
-  const notifier: HubPostReviewGateway = { findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
+  const notifier: HubPostReviewGateway = { editNotification: async () => {}, findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
     lookups.push(target);
     if (failFind) throw new Error("secret response body");
     return notices.some(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
@@ -56,6 +56,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     beforeNotify?.(nonce);
     if (failNotify) throw new Error("secret response body");
     notices.push({ guildId, target, view, nonce });
+    return { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(500 + notices.length) };
   } };
   const log = (event: string) => logs.push(event);
   const makeReview = () => new HubReview(notifier, settings, extracted, deliveries, hub, log, () => 1000,
@@ -467,7 +468,8 @@ test("旧宛先に届いた成否不明の通知も、別宛先では nonce の�
   const notify = f.notifier.notify;
   f.notifier.notify = async (guildId, target, view, nonce) => {
     // Discord の送信者単位の重複排除を再現する。
-    if (!f.notices.some(n => n.nonce === nonce)) await notify(guildId, target, view, nonce);
+    if (!f.notices.some(n => n.nonce === nonce)) return notify(guildId, target, view, nonce);
+    return { channelId: "11", messageId: "501" };
   };
   f.extracted.markReviewNotified = () => { throw new Error("保存前の停止"); };
   await f.review.flush(); f.reopen();

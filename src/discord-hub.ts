@@ -3,7 +3,7 @@ import {
   MessageFlags, PermissionFlagsBits, SlashCommandBuilder, StringSelectMenuBuilder,
   type Client, type Interaction,
 } from "discord.js";
-import type { HubInteraction, HubView } from "./hub-setup";
+import { HubNotificationPermissionError, type HubInteraction, type HubView } from "./hub-setup";
 
 export const hubCommand = new SlashCommandBuilder().setName("hub").setDescription("Hub 連携の設定")
   .setDMPermission(false)
@@ -38,6 +38,10 @@ export function hubInteraction(interaction: Interaction): HubInteraction | undef
   if (!(interaction.isChatInputCommand() || interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isButton())) return;
   return {
     guildId: interaction.guildId, userId: interaction.user.id,
+    userDisplayName: interaction.member && "displayName" in interaction.member
+      ? interaction.member.displayName : interaction.member?.nick ?? interaction.user.displayName,
+    ...(interaction.isButton() && interaction.message
+      ? { notification: { channelId: interaction.channelId, messageId: interaction.message.id } } : {}),
     kind: command ? "command" : "component",
     action: interaction.isChatInputCommand() ? interaction.options.getSubcommand() : interaction.customId,
     values: interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() ? interaction.values : [],
@@ -65,7 +69,10 @@ export async function validateHubChannels(client: Client, guildId: string, chann
     const me = channel.guild.members.me ?? await channel.guild.members.fetchMe();
     const required = purpose === "read"
       ? [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
-      : [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages];
-    if (!channel.permissionsFor(me)?.has(required)) throw new Error("Missing channel permissions");
+      : [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+    if (!channel.permissionsFor(me)?.has(required)) {
+      if (purpose === "notify") throw new HubNotificationPermissionError();
+      throw new Error("Missing channel permissions");
+    }
   }
 }
