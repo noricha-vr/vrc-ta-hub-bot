@@ -76,7 +76,11 @@ export class HubDeliveryStore {
     })();
   }
   enqueue(draftId: string, guildId: string, communityId: number): void {
-    this.db.query("INSERT OR IGNORE INTO hub_deliveries (draft_id, guild_id, community_id) VALUES (?, ?, ?)")
+    this.db.query(`INSERT INTO hub_deliveries (draft_id, guild_id, community_id) VALUES (?, ?, ?)
+      ON CONFLICT (draft_id) DO UPDATE SET state = CASE
+        WHEN hub_id IS NOT NULL THEN 'ready' WHEN attempted_hash <> '' THEN 'creating' ELSE 'queued' END,
+        attempts = 0, next_at = 0, reason = ''
+      WHERE state = 'closed' AND reason = 'setting_removed'`)
       .run(draftId, guildId, communityId);
   }
   get(id: string): HubDelivery | undefined {
@@ -88,25 +92,25 @@ export class HubDeliveryStore {
     ).all(now);
   }
   creating(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ? WHERE draft_id = ?").run(hash, id);
+    this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ? WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
   }
   requeue(id: string): void {
-    this.db.query("UPDATE hub_deliveries SET state = 'queued', attempted_hash = '' WHERE draft_id = ?").run(id);
+    this.db.query("UPDATE hub_deliveries SET state = 'queued', attempted_hash = '' WHERE draft_id = ? AND state <> 'closed'").run(id);
   }
   created(id: string, hubId: number, hash: string): void {
     this.db.query(`UPDATE hub_deliveries SET state = 'ready', hub_id = ?, synced_hash = ?,
-      attempts = 0, next_at = 0, reason = '' WHERE draft_id = ?`).run(hubId, hash, id);
+      attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'`).run(hubId, hash, id);
   }
   synced(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET synced_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ?").run(hash, id);
+    this.db.query("UPDATE hub_deliveries SET synced_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
   }
   notified(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ?").run(hash, id);
+    this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
   }
   retry(id: string, now: number, reason: string): void {
     const attempts = (this.get(id)?.attempts ?? 0) + 1;
     const delay = Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
-    this.db.query("UPDATE hub_deliveries SET attempts = ?, next_at = ?, reason = ? WHERE draft_id = ?")
+    this.db.query("UPDATE hub_deliveries SET attempts = ?, next_at = ?, reason = ? WHERE draft_id = ? AND state <> 'closed'")
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string, now = Math.floor(Date.now() / 1000)): boolean {
@@ -149,7 +153,8 @@ export class HubDeliveryStore {
   pendingReviews(now: number, guildId?: string, communityId?: number): HubReviewStats {
     const row = this.db.query<{ n: number; oldest: number | null }, [string | null, string | null, number | null, number | null]>(`
       SELECT count(*) AS n, min(r.created_at) AS oldest FROM hub_review_decisions r
-      JOIN hub_deliveries d ON d.draft_id = r.draft_id WHERE d.state <> 'closed'
+      JOIN hub_deliveries d ON d.draft_id = r.draft_id
+      JOIN hub_settings s ON s.guild_id = d.guild_id AND s.community_id = d.community_id WHERE d.state <> 'closed'
         AND (? IS NULL OR d.guild_id = ?) AND (? IS NULL OR d.community_id = ?)
     `).get(guildId ?? null, guildId ?? null, communityId ?? null, communityId ?? null)!;
     return { count: row.n, oldestAgeSeconds: Math.max(0, Math.floor(now - (row.oldest ?? now))) };
@@ -173,10 +178,14 @@ export class HubDeliveryStore {
   counts(): Record<string, number> {
     const counts: Record<string, number> = {};
     for (const row of this.db.query<{ state: string; n: number }, []>(
-      "SELECT state, count(*) AS n FROM hub_deliveries GROUP BY state",
+      `SELECT state, count(*) AS n FROM hub_deliveries d WHERE state = 'closed' OR EXISTS (
+        SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
+      ) GROUP BY state`,
     ).all()) counts[row.state] = row.n;
     counts.retry = this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM hub_deliveries d
-      WHERE state <> 'closed' AND (reason <> '' OR EXISTS (
+      WHERE state <> 'closed' AND EXISTS (
+        SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
+      ) AND (reason <> '' OR EXISTS (
         SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
       ))`).get()!.n;
     return counts;

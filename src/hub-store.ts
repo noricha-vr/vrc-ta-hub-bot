@@ -149,6 +149,14 @@ export class HubStore extends MessageStore {
   leave(guildId: string, communityId?: number, pendingLeaveIfEmpty = false): void {
     this.db.transaction(() => {
       const settings = this.settings(guildId).filter(setting => communityId === undefined || setting.community.id === communityId);
+      if (this.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hub_deliveries'").get()) {
+        this.db.query(`DELETE FROM hub_review_decisions WHERE draft_id IN (
+          SELECT draft_id FROM hub_deliveries WHERE guild_id = ? AND (? IS NULL OR community_id = ?)
+        )`).run(guildId, communityId ?? null, communityId ?? null);
+        this.db.query(`UPDATE hub_deliveries SET state = 'closed', reason = 'setting_removed', decision = NULL, discord_id = NULL
+          WHERE state <> 'closed' AND guild_id = ? AND (? IS NULL OR community_id = ?)`)
+          .run(guildId, communityId ?? null, communityId ?? null);
+      }
       for (const setting of settings) {
         this.db.query("DELETE FROM hub_settings WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);
         this.db.query("DELETE FROM hub_channels WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);

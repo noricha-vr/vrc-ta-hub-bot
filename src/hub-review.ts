@@ -30,20 +30,31 @@ export class HubReview {
   ) {}
 
   private setting(row: HubDelivery): HubSetting | undefined {
-    const source = this.extracted.get(row.draft_id)?.sources[0];
-    return source && this.settings.messageSettings(source.channelId, source.messageId)
-      .find(s => s.guildId === row.guild_id && s.community.id === row.community_id);
+    const draft = this.extracted.get(row.draft_id);
+    if (draft?.meetingId !== String(row.community_id)) return;
+    return this.draftSetting(draft, row.guild_id);
+  }
+
+  private draftSetting(draft: TalkDraft, guildId?: string): HubSetting | undefined {
+    for (const source of draft.sources) {
+      const match = /^https:\/\/discord\.com\/channels\/([0-9]{1,20})\/([0-9]{1,20})\/([0-9]{1,20})$/.exec(source.url);
+      if (!match || source.channelId !== match[2] || source.messageId !== match[3] || (guildId && guildId !== match[1])) continue;
+      const setting = this.settings.messageSettings(source.channelId, source.messageId)
+        .find(s => s.guildId === match[1] && String(s.community.id) === draft.meetingId);
+      if (setting) return setting;
+    }
   }
 
   /** 抽出保存と enqueue の間で停止しても、抽出済み項目から復旧する。 */
   private enqueue(): void {
     for (const draft of this.extracted.allDrafts()) {
-      const source = draft.sources[0];
-      const match = source && /^https:\/\/discord\.com\/channels\/([0-9]{1,20})\/([0-9]{1,20})\/([0-9]{1,20})$/.exec(source.url);
-      if (!match || source?.channelId !== match[2] || source.messageId !== match[3]) continue;
-      const setting = this.settings.messageSettings(source.channelId, source.messageId)
-        .find(s => s.guildId === match[1] && String(s.community.id) === draft.meetingId);
-      if (setting) this.deliveries.enqueue(draft.id, setting.guildId, setting.community.id);
+      const setting = this.draftSetting(draft);
+      if (!setting) continue;
+      const previous = this.deliveries.get(draft.id);
+      this.deliveries.enqueue(draft.id, setting.guildId, setting.community.id);
+      if (previous?.state === "closed" && previous.reason === "setting_removed" && previous.hub_id) {
+        this.recordDraft(previous, draft, previous.hub_id, false);
+      }
     }
   }
 
@@ -69,9 +80,9 @@ export class HubReview {
   private async run(): Promise<void> {
     this.enqueue();
     for (const row of this.deliveries.due(this.now())) {
-      if (this.busy.has(row.draft_id) || !this.setting(row) || this.deliveries.decisions(row.draft_id).length) continue;
+      if (this.busy.has(row.draft_id) || !this.setting(row)) continue;
       const unlock = await this.lock(row.draft_id);
-      try { await this.deliver(row); }
+      try { await this.deliver(row.draft_id); }
       catch {
         this.deliveries.retry(row.draft_id, this.now(), "hub_delivery_failed");
         this.log("hub_delivery_retry");
@@ -82,9 +93,11 @@ export class HubReview {
       if (!row?.hub_id || row.state === "closed" || this.busy.has(row.draft_id) || !this.setting(row)) continue;
       const unlock = await this.lock(row.draft_id);
       try {
+        const current = this.deliveries.get(row.draft_id);
+        if (!current?.hub_id || current.state === "closed" || !this.setting(current)) continue;
         const decision = this.deliveries.decision(row.draft_id, pending.discord_id);
         if (!decision || decision.next_at > this.now()) continue;
-        await this.submitDecision(row, decision);
+        await this.submitDecision(current, decision);
       }
       catch {
         this.deliveries.retryDecision(row.draft_id, pending.discord_id, this.now());
@@ -99,11 +112,12 @@ export class HubReview {
       slide_url: materials[0]?.url ?? "", additional_info: materials.map(m => html(m.url)).join("\n") };
   }
 
-  private async deliver(initial: HubDelivery): Promise<void> {
-    const draft = this.extracted.get(initial.draft_id);
+  private async deliver(id: string): Promise<void> {
+    let row = this.deliveries.get(id);
+    if (!row || row.state === "closed" || !this.setting(row)) return;
+    const draft = this.extracted.get(id);
     if (!draft) return;
     const hash = fingerprint(draft);
-    let row = initial;
     if (row.state === "creating") {
       const found = await this.hub.findDraft(draft.sources[0]!.url);
       if (!found) {
@@ -116,9 +130,9 @@ export class HubReview {
       if (this.extracted.pending(draft.sources[0]!.messageId)?.reason === "hub_create_unconfirmed") {
         this.extracted.clearPending(draft.sources[0]!.messageId);
       }
-      this.recordDraft(row, draft, found.id, false);
+      this.recordDraft(row, draft, found.id, found.status === "approved");
       if (found.status && found.status !== "pending") {
-        this.deliveries.closed(row.draft_id, "already_reviewed"); return;
+        this.deliveries.closed(row.draft_id, found.status); return;
       }
       row = this.deliveries.get(row.draft_id)!;
     }
@@ -140,11 +154,7 @@ export class HubReview {
       this.log("hub_draft_created");
       row = this.deliveries.get(row.draft_id)!;
     } else if (row.synced_hash !== hash) {
-      // 続報では題名や承認状態を上書きせず、資料だけ更新する。
-      const fields = this.fields(draft, 0);
-      await this.hub.updateDraft(row.hub_id!, { slide_url: fields.slide_url, additional_info: fields.additional_info });
-      this.deliveries.synced(row.draft_id, hash);
-      this.log("hub_draft_updated");
+      await this.sync(row, draft);
       row = this.deliveries.get(row.draft_id)!;
     }
     const setting = this.setting(row);
@@ -165,14 +175,37 @@ export class HubReview {
     }
   }
 
+  private async sync(row: HubDelivery, draft: TalkDraft): Promise<void> {
+    const hash = fingerprint(draft);
+    if (row.synced_hash === hash) return;
+    // 続報では題名や承認状態を上書きせず、資料だけ更新する。
+    const fields = this.fields(draft, 0);
+    await this.hub.updateDraft(row.hub_id!, { slide_url: fields.slide_url, additional_info: fields.additional_info });
+    this.deliveries.synced(row.draft_id, hash);
+    this.log("hub_draft_updated");
+  }
+
   private recordDraft(row: HubDelivery, draft: TalkDraft, id: number, approved: boolean): void {
     if (this.setting(row)) this.settings.saveDraft({ id: String(id), guildId: row.guild_id, communityId: row.community_id,
       sourceUrl: draft.sources[0]!.url, createdAt: new Date(this.now() * 1000).toISOString(), approved });
   }
 
+  private async finishDecision(row: HubDelivery, decision: "approved" | "rejected"): Promise<void> {
+    for (;;) {
+      const current = this.deliveries.get(row.draft_id)!;
+      if (current.state === "closed" || !this.setting(current)) return;
+      const draft = this.extracted.get(row.draft_id)!;
+      if (current.synced_hash !== fingerprint(draft)) { await this.sync(current, draft); continue; }
+      this.recordDraft(current, draft, current.hub_id!, decision === "approved");
+      this.deliveries.closed(current.draft_id, decision);
+      return;
+    }
+  }
+
   private async submitDecision(row: HubDelivery, pending: HubReviewDecision): Promise<"done" | "forbidden" | "processed"> {
     this.sending.set(row.draft_id, pending.discord_id);
     try {
+      await this.sync(row, this.extracted.get(row.draft_id)!);
       try { await this.hub.reviewDraft(row.hub_id!, pending.decision, pending.discord_id); }
       catch (error) {
         if (error instanceof HubApiError && error.status === 403) {
@@ -184,14 +217,11 @@ export class HubReview {
         const draft = this.extracted.get(row.draft_id)!;
         const found = await this.hub.findDraft(draft.sources[0]!.url);
         if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
-        this.recordDraft(row, draft, found.id, found.status === "approved");
-        this.deliveries.closed(row.draft_id, found.status);
+        await this.finishDecision(row, found.status);
         this.log("hub_review_already_processed"); return "processed";
       }
       this.deliveries.recordReviewer(row.draft_id, pending.discord_id);
-      const draft = this.extracted.get(row.draft_id)!;
-      this.recordDraft(row, draft, row.hub_id!, pending.decision === "approved");
-      this.deliveries.closed(row.draft_id, pending.decision);
+      await this.finishDecision(row, pending.decision);
       this.log(pending.decision === "approved" ? "hub_review_approved" : "hub_review_rejected");
       return "done";
     } finally { this.sending.delete(row.draft_id); }

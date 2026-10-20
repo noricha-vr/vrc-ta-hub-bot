@@ -190,6 +190,30 @@ test("guildDelete removes every community and only unapproved drafts in that gui
   expect(f.store.cursor("10")).toBe("0"); expect(f.gateway.leftGuilds).toEqual([]);
 });
 
+for (const action of ["leave", "guildDelete"]) test(`${action} closes only the removed settings' deliveries and clears their pending reviews`, async () => {
+  const f = fixture(); await f.bot.start("fake"); await f.setup(["10"]); await f.setup(["11"], 2);
+  f.store.configure({ guildId: "200", community: owner, channelIds: ["20"], notification: { type: "dm", userId } }, f.baseline());
+  for (const [id, guildId, communityId] of [["first", "100", 1], ["second", "100", 2], ["other", "200", 1]] as const) {
+    f.deliveries.enqueue(id, guildId, communityId); f.deliveries.created(id, 42, "hash");
+    f.deliveries.queueDecision(id, "approved", userId, 1000); f.deliveries.retryDecision(id, userId, 1000);
+  }
+  f.deliveries.enqueue("queued", "100", 1);
+  f.deliveries.enqueue("creating", "100", 1); f.deliveries.creating("creating", "hash");
+  if (action === "leave") await f.action("leave");
+  else f.gateway.events!.guildDelete!("100");
+  expect(f.deliveries.get("first")?.state).toBe("closed");
+  expect(f.deliveries.get("queued")?.state).toBe("closed");
+  expect(f.deliveries.get("creating")?.state).toBe("closed");
+  expect(f.deliveries.decisions("first")).toEqual([]);
+  expect(f.deliveries.get("second")?.state).toBe(action === "leave" ? "ready" : "closed");
+  expect(f.deliveries.decisions("second")).toHaveLength(action === "leave" ? 1 : 0);
+  expect(f.deliveries.get("other")?.state).toBe("ready");
+  expect(f.deliveries.decisions("other")).toHaveLength(1);
+  expect(f.deliveries.pendingReviews(1100).count).toBe(action === "leave" ? 2 : 1);
+  await f.setup(["10"]);
+  expect((await f.action("status")).content).toContain("判断の再送待ち：0 件（最古の待ち時間：0 秒）");
+});
+
 test("channel permission failure or revoked membership cannot commit settings", async () => {
   const f = fixture();
   f.gateway.beforeValidate = async () => { throw new Error("secret response body"); };

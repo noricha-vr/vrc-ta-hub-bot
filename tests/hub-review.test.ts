@@ -40,7 +40,7 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   let reviewFailure: "none" | "lost" | "timeout" = "none";
   let reviewUserId: string | undefined;
   let beforeCreate: (() => void) | undefined;
-  let beforePatch: (() => void) | undefined;
+  let beforePatch: ((id: number) => void | Promise<void>) | undefined;
   let beforeReview: (() => Promise<void>) | undefined;
   let found: Array<Record<string, unknown>> = [];
   let createCount = 0;
@@ -73,9 +73,11 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
       if (createFailure === "unreadable") return new Response("invalid json", { status: 201 });
       return Response.json({ id }, { status: 201 });
     }
-    if (url.pathname === "/api/v1/event-details/42/" && options.method === "PATCH") {
-      beforePatch?.();
-      return patchDown ? new Response("unavailable", { status: 503 }) : Response.json({ id: 42 });
+    const patchPath = /^\/api\/v1\/event-details\/(\d+)\/$/.exec(url.pathname);
+    if (patchPath && options.method === "PATCH") {
+      const id = Number(patchPath[1]);
+      await beforePatch?.(id);
+      return patchDown ? new Response("unavailable", { status: 503 }) : Response.json({ id });
     }
     const reviewPath = /^\/api\/v1\/event-details\/(\d+)\/review\/$/.exec(url.pathname);
     if (reviewPath) {
@@ -123,7 +125,7 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
     setReviewFailure: (value: typeof reviewFailure) => { reviewFailure = value; },
     setReviewUser: (value: string) => { reviewUserId = value; },
     setReviewStatus: (value: number) => { reviewStatus = value; }, setFound: (value: typeof found) => { found = value; },
-    beforeCreate: (fn: () => void) => { beforeCreate = fn; }, beforePatch: (fn: () => void) => { beforePatch = fn; },
+    beforeCreate: (fn: () => void) => { beforeCreate = fn; }, beforePatch: (fn: NonNullable<typeof beforePatch>) => { beforePatch = fn; },
     beforeReview: (fn: () => Promise<void>) => { beforeReview = fn; },
   };
 }
@@ -836,6 +838,126 @@ test("取り外し後に再設定しても新しい導入境界より前の待�
   f.advance(); f.setEventsDown(false); await f.review.flush();
   expect(f.createCount).toBe(0);
   const stale = interaction(draft.id); await f.review.handle(stale.i); expect(stale.views[0]!.content).toContain("古くなりました");
+});
+
+for (const delivered of [false, true]) test(`再設定後の新しい応募が同じ下書きに加わったら新しい出典で配送を再開する（作成済み: ${delivered}）`, async () => {
+  const f = fixture(); const draft = f.create();
+  f.setEventsDown(!delivered); await f.review.flush();
+  f.settings.leave("100", 1);
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "dm", userId } }, "200");
+  f.setEventsDown(false); f.advance(); await f.review.flush();
+  const before = f.calls.length;
+  expect(f.create(userId, "201").id).toBe(draft.id);
+  f.reopen(); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42 });
+  expect(f.createCount).toBe(1);
+  expect(f.calls.slice(before).some(c => c.method === (delivered ? "PATCH" : "POST"))).toBe(true);
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(false);
+  expect(f.notifications.at(-1)?.target).toEqual({ type: "dm", userId });
+});
+
+test("設定のない配送と判断の保留は健康状態の集計から除く", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const other = f.create("223456789012345678", "102"); await f.review.flush();
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try {
+    db.query("UPDATE hub_deliveries SET guild_id = '200' WHERE draft_id = ?").run(draft.id);
+    f.deliveries.queueDecision(draft.id, "approved", userId, 900);
+    f.deliveries.retryDecision(draft.id, userId, 900);
+    f.deliveries.queueDecision(other.id, "approved", userId, 1000);
+    expect(f.review.pendingReviews()).toEqual({ count: 1, oldestAgeSeconds: 0 });
+    expect(f.review.pendingReviews("200", 1)).toEqual({ count: 0, oldestAgeSeconds: 0 });
+    expect(f.deliveries.counts()).toMatchObject({ ready: 1, retry: 0 });
+  } finally { db.close(); }
+});
+
+for (const retryDue of [false, true]) test(`判断の保留中も続報を同期し、再送時刻まで判断を待つ（再送時刻到達: ${retryDue}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  await f.review.handle(interaction(draft.id).i);
+  f.followUp(draft); f.reopen(); f.setReviewStatus(200);
+  if (retryDue) f.advance(300);
+  const before = f.calls.length; await f.review.flush();
+  const calls = f.calls.slice(before);
+  expect(calls[0]).toMatchObject({ path: "/api/v1/event-details/42/", method: "PATCH" });
+  expect(calls[0]?.body?.additional_info).toContain("102.pdf");
+  expect(calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(retryDue ? 1 : 0);
+  expect(f.deliveries.get(draft.id)?.state).toBe(retryDue ? "closed" : "ready");
+});
+
+test("続報の PATCH が失敗したら判断を閉じず、資料の同期後に確定する", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  await f.review.handle(interaction(draft.id).i);
+  f.followUp(draft); f.setPatchDown(true); f.setReviewStatus(200); f.advance(300);
+  await f.review.flush();
+  expect(f.deliveries.get(draft.id)?.state).toBe("ready");
+  expect(f.deliveries.decisions(draft.id)).toHaveLength(1);
+  f.reopen(); f.setPatchDown(false); f.advance(); await f.review.flush();
+  expect(f.calls.filter(c => c.method === "PATCH").at(-1)?.body?.additional_info).toContain("102.pdf");
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
+  expect(f.deliveries.decisions(draft.id)).toEqual([]);
+});
+
+for (const reconciled of [false, true]) test(`ボタンからの判断中に届く続報も配送を閉じる前に同期する（照合: ${reconciled}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.beforeReview(async () => { f.followUp(draft); });
+  if (reconciled) {
+    f.setReviewStatus(409);
+    f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
+  }
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.calls.filter(c => c.method === "PATCH").at(-1)?.body?.additional_info).toContain("102.pdf");
+  expect(f.deliveries.get(draft.id)?.state).toBe("closed");
+  expect(f.notifications).toHaveLength(1);
+});
+
+test("判断後の PATCH 中に追加された資料も同期してから配送を閉じる", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.beforeReview(async () => { f.followUp(draft); });
+  f.beforePatch(() => { f.followUp(draft, "103"); });
+  await f.review.handle(interaction(draft.id).i);
+  const patches = f.calls.filter(c => c.method === "PATCH");
+  expect(patches).toHaveLength(2);
+  expect(patches.at(-1)?.body?.additional_info).toContain("103.pdf");
+  expect(f.deliveries.get(draft.id)?.state).toBe("closed");
+});
+
+for (const status of [201, 400]) test(`作成 POST 中の leave を後の ${status} 応答で再開しない`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateStatus(status);
+  f.beforeCreate(() => { f.settings.leave("100", 1); });
+  await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed" });
+  expect(f.settings.drafts("100", 1)).toEqual([]); expect(f.notifications).toEqual([]);
+  expect(f.review.pendingReviews()).toEqual({ count: 0, oldestAgeSeconds: 0 });
+});
+
+test("flush の配送一覧を読んだ後にボタンで閉じた下書きには PATCH と承認待ち通知を送らない", async () => {
+  const f = fixture(); const first = f.create(); const second = f.create("223456789012345678", "102");
+  await f.review.flush(); f.followUp(first, "103"); f.followUp(second, "104");
+  let release!: () => void; let started!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  f.beforePatch(async id => { if (id === 42) { started(); await waiting; } });
+  const flushing = f.review.flush(); await entered;
+  try {
+    await f.review.handle(interaction(second.id).i);
+    expect(f.deliveries.get(second.id)?.state).toBe("closed");
+    const before = f.calls.length;
+    release(); await flushing;
+    expect(f.calls.slice(before).some(c => c.path === "/api/v1/event-details/43/" && c.method === "PATCH")).toBe(false);
+    expect(f.notifications).toHaveLength(3);
+  } finally { release(); await flushing; }
+});
+
+for (const status of ["approved", "rejected"] as const) test(`作成応答の照合で ${status} なら状態を保存し、leave でも承認済みを残す`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateFailure("lost"); await f.review.flush();
+  f.reopen(); f.advance(); f.setCreateFailure("none");
+  f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status }]);
+  await f.review.flush();
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(status === "approved");
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: status });
+  expect(f.notifications).toEqual([]);
+  f.settings.leave("100", 1);
+  expect(f.settings.drafts("100", 1)).toHaveLength(status === "approved" ? 1 : 0);
 });
 
 test("成否不明の保留が後から照合できたら、その保留だけ解消する", async () => {

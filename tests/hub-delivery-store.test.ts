@@ -4,13 +4,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HubDeliveryStore } from "../src/hub-delivery-store";
+import { HubStore } from "../src/hub-store";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function databasePath(): string {
   const dir = mkdtempSync(join(tmpdir(), "hub-delivery-"));
   dirs.push(dir);
-  return join(dir, "state.sqlite");
+  const path = join(dir, "state.sqlite");
+  const settings = new HubStore(path);
+  try {
+    for (const [guildId, id] of [["100", 1], ["100", 2], ["200", 1]] as const) {
+      settings.configure({ guildId, community: { id, name: "集会", role: "owner", recording_allowed: false },
+        channelIds: ["10"], notification: { type: "dm", userId: "123" } }, "100");
+    }
+  } finally { settings.close(); }
+  return path;
 }
 
 test("旧 DB の保留は操作者・判断・試行回数・再送時刻を保って移行し、通常の配送待ちは変えない", () => {
