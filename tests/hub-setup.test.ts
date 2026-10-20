@@ -7,6 +7,7 @@ import { HubBot } from "../src/bot";
 import type { HubCommunity } from "../src/hub-api";
 import { HubSetup, setupBaseline, type HubInteraction, type HubView } from "../src/hub-setup";
 import { HubStore } from "../src/hub-store";
+import { HubDeliveryStore } from "../src/hub-delivery-store";
 import { FakeGateway, message } from "./fake-gateway";
 
 const userId = "123456789012345678";
@@ -19,6 +20,7 @@ function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "hub-setup-"));
   const path = join(dir, "state.sqlite");
   const store = new HubStore(path);
+  const deliveries = new HubDeliveryStore(path);
   const gateway = new FakeGateway();
   const logs: string[] = [];
   let memberships: HubCommunity[] = [owner, staff];
@@ -27,10 +29,11 @@ function fixture() {
   let bot: HubBot;
   const hub = new HubSetup(gateway, store, { communities: async id => {
     expect(id).toBe(userId); await lookup?.(); return memberships;
-  } }, () => bot.refreshChannels(), event => logs.push(event), () => now);
+  } }, () => bot.refreshChannels(), event => logs.push(event), () => now,
+  { pendingReviews: (guildId, communityId) => deliveries.pendingReviews(Math.floor(now / 1000), guildId, communityId) });
   bot = new HubBot(gateway, store, { channelIds: () => store.channelIds(), baseline: id => store.baseline(id), hub,
     healthPath: join(dir, "health.json"), log: event => logs.push(event), heartbeatMs: 60000 });
-  cleanups.push(async () => { await bot.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); });
+  cleanups.push(async () => { await bot.stop(); deliveries.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   async function interact(action: string, values: string[] = [], kind: "command" | "component" = "command", overrides: Partial<HubInteraction> = {}): Promise<HubView> {
     let result: HubView | undefined;
     let deferred = false;
@@ -55,7 +58,7 @@ function fixture() {
     return view;
   }
   async function action(action: string, communityId = 1) { return select(await interact(action), [String(communityId)]); }
-  return { dir, path, store, gateway, bot, hub, logs, interact, select, setup, action,
+  return { dir, path, store, deliveries, gateway, bot, hub, logs, interact, select, setup, action,
     setMemberships: (value: HubCommunity[]) => { memberships = value; },
     setLookup: (value: (() => Promise<void>) | undefined) => { lookup = value; },
     tick: (ms: number) => { now += ms; }, baseline: () => setupBaseline(now) };
@@ -134,6 +137,20 @@ test("pause stops reads and setup resumes; status includes channels and recent d
   expect((await f.action("status")).content).toContain("一時停止中");
   await f.setup(["10"]);
   expect(f.store.settings()[0]?.paused).toBe(false);
+});
+
+test("status は選んだサーバー・集会の保留の行数と最古の経過秒数だけを表示する", async () => {
+  const f = fixture(); await f.setup(["10"]);
+  for (const [id, guildId, communityId] of [["first", "100", 1], ["second", "100", 1],
+    ["other-community", "100", 2], ["other-guild", "200", 1]] as const) {
+    f.deliveries.enqueue(id, guildId, communityId); f.deliveries.created(id, 42, "hash");
+    f.deliveries.queueDecision(id, "approved", userId, Date.parse("2026-10-19T00:00:00Z") / 1000);
+  }
+  f.deliveries.queueDecision("second", "rejected", "223456789012345678", Date.parse("2026-10-19T00:00:10Z") / 1000);
+  f.tick(90000);
+  expect((await f.action("status")).content).toContain("判断の再送待ち：3 件（最古の待ち時間：90 秒）");
+  f.deliveries.closed("first", "approved"); f.deliveries.closed("second", "rejected");
+  expect((await f.action("status")).content).toContain("判断の再送待ち：0 件（最古の待ち時間：0 秒）");
 });
 
 test("leave deletes settings, unapproved drafts, cursors and inbox, then leaves the last guild", async () => {

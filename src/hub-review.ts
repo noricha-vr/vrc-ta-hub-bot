@@ -51,6 +51,9 @@ export class HubReview {
     this.active = this.run().finally(() => { this.active = undefined; });
     return this.active;
   }
+  pendingReviews(guildId?: string, communityId?: number) {
+    return this.deliveries.pendingReviews(this.now(), guildId, communityId);
+  }
   private async lock(id: string): Promise<() => void> {
     const previous = this.busy.get(id);
     let release!: () => void;
@@ -182,6 +185,7 @@ export class HubReview {
       this.deliveries.closed(row.draft_id, found.status);
       this.log("hub_review_already_processed"); return "processed";
     }
+    this.deliveries.recordReviewer(row.draft_id, pending.discord_id);
     const draft = this.extracted.get(row.draft_id)!;
     this.recordDraft(row, draft, row.hub_id!, pending.decision === "approved");
     this.deliveries.closed(row.draft_id, pending.decision);
@@ -201,9 +205,14 @@ export class HubReview {
       if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
       const decision = match![2] as "approved" | "rejected";
       const pending = this.deliveries.decision(row.draft_id, i.userId);
-      this.deliveries.queueDecision(row.draft_id, decision, i.userId);
+      if (!this.deliveries.queueDecision(row.draft_id, decision, i.userId, this.now())) {
+        this.log("hub_review_queue_full");
+        await i.edit(text("ハブに接続できません。復旧後にもう一度押してください")); return;
+      }
       if (pending) {
-        await i.edit(text("この発表は処理中です。しばらく待ってから確認してください。")); return;
+        await i.edit(text(pending.decision !== decision
+          ? `再送待ちの判断を${decision === "approved" ? "承認" : "却下"}に変更しました`
+          : "この発表は処理中です。しばらく待ってから確認してください。")); return;
       }
       // 他人の送信中も本人の判断を保存し、同じ下書きへの操作を順番に送る。
       unlock = await this.lock(row.draft_id);

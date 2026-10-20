@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HubApi, type HubRequest } from "../src/hub-api";
@@ -73,14 +74,16 @@ function fixture() {
       beforePatch?.();
       return patchDown ? new Response("unavailable", { status: 503 }) : Response.json({ id: 42 });
     }
-    if (url.pathname === "/api/v1/event-details/42/review/") {
+    const reviewPath = /^\/api\/v1\/event-details\/(\d+)\/review\/$/.exec(url.pathname);
+    if (reviewPath) {
+      const id = Number(reviewPath[1]);
       await beforeReview?.();
       if (reviewFailure === "timeout") throw new Error("synthetic timeout");
       if (reviewStatus !== 200) return new Response(reviewStatus === 204 ? null : "{}", { status: reviewStatus });
       if (reviewUserId && body.discord_id !== reviewUserId) return new Response("forbidden", { status: 403 });
-      if (found.some(row => row.id === 42 && row.status !== "pending")) return new Response("{}", { status: 409 });
+      if (found.some(row => row.id === id && row.status !== "pending")) return new Response("{}", { status: 409 });
       const status = body.decision;
-      found = [{ id: 42, source_url: source.url, source: "discord_bot", status }];
+      found = found.map(row => row.id === id ? { ...row, status } : row);
       if (reviewFailure === "lost") throw new Error("synthetic lost review response");
       return Response.json({ status });
     }
@@ -94,8 +97,9 @@ function fixture() {
   const makeReview = () => new HubReview(gateway, settings, extracted, deliveries, hub, event => log.push(event), () => now);
   let review = makeReview();
   settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "channel", channelId: "11" } }, "100");
-  const create = () => extracted.create({ meetingId: "1", presenterId: userId, presenterName: "発表者 <@123>",
-    eventDate: "2026-10-25", title: "題名 <script>", materials: [{ kind: "slides", url: "https://example.invalid/slides/one" }] }, source).draft;
+  const create = (presenterId = userId, messageId = "101") => extracted.create({ meetingId: "1", presenterId, presenterName: "発表者 <@123>",
+    eventDate: "2026-10-25", title: "題名 <script>", materials: [{ kind: "slides", url: "https://example.invalid/slides/one" }] },
+    { ...source, messageId, url: `https://discord.com/channels/100/10/${messageId}` }).draft;
   const followUp = (draft: TalkDraft, id = "102") => extracted.addFollowUp(draft.id,
     [{ kind: "pdf", url: `https://example.invalid/${id}.pdf` }], { ...source, messageId: id, url: `https://discord.com/channels/100/10/${id}` });
   cleanups.push(() => { deliveries.close(); extracted.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -278,6 +282,100 @@ test("レビューの障害時も押した人と判断を永続化し、復旧�
   expect(f.calls.filter(c => c.path.endsWith("/review/")).every(c => c.body?.discord_id === userId)).toBe(true);
 });
 
+test("障害中は 5 人分まで保留し、6 人目は保存も送信もしないが本人の変更は受け付ける", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  f.setReviewUser("223456789012345678");
+  const actors = Array.from({ length: 6 }, (_, n) => String(BigInt(userId) + BigInt(n)));
+  for (const actor of actors.slice(0, 5)) await f.review.handle(interaction(draft.id, "rejected", "100", actor).i);
+  const pending = f.deliveries.decisions(draft.id);
+  const before = f.calls.length;
+  const sixth = interaction(draft.id, "rejected", "100", actors[5]!); await f.review.handle(sixth.i);
+  expect(sixth.views[0]!.content).toBe("ハブに接続できません。復旧後にもう一度押してください");
+  expect(f.deliveries.decision(draft.id, actors[5]!)).toBeUndefined();
+  expect(f.deliveries.decisions(draft.id)).toEqual(pending);
+  expect(f.calls).toHaveLength(before); expect(f.log).toContain("hub_review_queue_full");
+  f.advance(10);
+  const changed = interaction(draft.id, "approved", "100", actors[0]!); await f.review.handle(changed.i);
+  expect(changed.views[0]!.content).toBe("再送待ちの判断を承認に変更しました");
+  expect(f.deliveries.decision(draft.id, actors[0]!)).toEqual({ ...pending[0]!, decision: "approved" });
+  expect(f.deliveries.decisions(draft.id)).toHaveLength(5); expect(f.calls).toHaveLength(before);
+  f.reopen(); await f.review.handle(sixth.i);
+  expect(f.deliveries.decisions(draft.id)).toHaveLength(5); expect(f.calls).toHaveLength(before);
+});
+
+for (const status of [200, 201, 204, 403, 409, 503]) test(`レビューの ${status} 応答では 200 の時だけ主催者の実績を保存する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(status);
+  if (status === 409) f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
+  await f.review.handle(interaction(draft.id).i); f.reopen();
+  const db = new Database(join(f.dir, "state.sqlite"), { readonly: true });
+  try {
+    expect(db.query("SELECT guild_id, community_id, discord_id FROM hub_reviewers").all())
+      .toEqual(status === 200 ? [{ guild_id: "100", community_id: 1, discord_id: userId }] : []);
+  } finally { db.close(); }
+});
+
+test("旧 DB に非主催者 5 人の保留があっても 200 の実績がある主催者から再送する", async () => {
+  const f = fixture(); const previous = f.create(); await f.review.flush();
+  const ownerId = "223456789012345678"; f.setReviewUser(ownerId);
+  await f.review.handle(interaction(previous.id, "approved", "100", ownerId).i);
+  const draft = f.create("323456789012345678", "102"); await f.review.flush(); f.setReviewStatus(503);
+  for (let n = 0; n < 5; n++) {
+    await f.review.handle(interaction(draft.id, "rejected", "100", String(BigInt(userId) + BigInt(n))).i);
+  }
+  // 上限導入前の DB に残った 6 人目の行を再現する。
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try {
+    db.query(`INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at, next_at)
+      VALUES (?, ?, 'approved', 1000, 1300)`).run(draft.id, ownerId);
+  } finally { db.close(); }
+  f.reopen(); f.advance(300); f.setReviewStatus(200);
+  expect(f.deliveries.decisions(draft.id)).toHaveLength(6);
+  const before = f.calls.length; await f.review.flush();
+  expect(f.calls.slice(before)).toEqual([
+    { path: "/api/v1/event-details/43/review/", method: "POST", body: { decision: "approved", discord_id: ownerId } },
+  ]);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
+  expect(f.deliveries.decisions(draft.id)).toEqual([]);
+});
+
+test("旧 DB の保留が 5 件を超えても flush ごとの再送は下書きごとに 5 件に収める", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try {
+    for (let n = 0; n < 7; n++) db.query(`INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at)
+      VALUES (?, ?, 'rejected', 1000)`).run(draft.id, String(BigInt(userId) + BigInt(n)));
+  } finally { db.close(); }
+  f.reopen(); const before = f.calls.filter(c => c.path.endsWith("/review/")).length;
+  await f.review.flush();
+  expect(f.calls.filter(c => c.path.endsWith("/review/")).slice(before).map(c => c.body?.discord_id))
+    .toEqual(Array.from({ length: 5 }, (_, n) => String(BigInt(userId) + BigInt(n))));
+  expect(f.deliveries.decisions(draft.id)).toHaveLength(7);
+  await f.review.flush();
+  expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(before + 7);
+});
+
+test("健康状態に保留の行数と最古の経過秒数を出し、判断変更と再起動でも待ち時間を保つ", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  await f.review.handle(interaction(draft.id).i); f.advance(30);
+  const otherId = "223456789012345678";
+  await f.review.handle(interaction(draft.id, "rejected", "100", otherId).i); f.advance(60);
+  await f.review.handle(interaction(draft.id, "rejected").i); f.reopen();
+  const gateway = new FakeGateway();
+  const bot = new HubBot(gateway, f.settings, { channelIds: [], work: { run: async () => {}, review: f.review },
+    healthPath: join(f.dir, "health.json"), heartbeatMs: 60000 });
+  const health = () => JSON.parse(readFileSync(join(f.dir, "health.json"), "utf8"));
+  try {
+    await bot.start("fake");
+    expect(health()).toMatchObject({ pendingReviewCount: 2, oldestPendingReviewAgeSeconds: 90 });
+    f.advance(10); gateway.events!.disconnected();
+    expect(health()).toMatchObject({ pendingReviewCount: 2, oldestPendingReviewAgeSeconds: 100 });
+    f.deliveries.clearDecision(draft.id, userId); gateway.events!.reconnecting();
+    expect(health()).toMatchObject({ pendingReviewCount: 1, oldestPendingReviewAgeSeconds: 70 });
+    f.deliveries.closed(draft.id, "approved"); gateway.events!.disconnected();
+    expect(health()).toMatchObject({ pendingReviewCount: 0, oldestPendingReviewAgeSeconds: 0 });
+  } finally { await bot.stop(); }
+});
+
 for (const failure of [201, 202, 204, 403, 409, 503, "timeout"] as const) test(`主催者の保留後に非主催者が押して ${failure} でも各人の判断を失わず照合・再送する`, async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   const ownerId = "223456789012345678"; f.setReviewUser(ownerId); f.setReviewStatus(503);
@@ -326,7 +424,7 @@ for (const failure of ["503", "timeout"] as const) test(`非主催者の ${failu
   await f.review.handle(interaction(draft.id, "rejected").i);
   expect(f.deliveries.decision(draft.id, userId)).toMatchObject({ decision: "rejected", discord_id: userId });
   const duplicate = interaction(draft.id); await f.review.handle(duplicate.i);
-  expect(duplicate.views[0]!.content).toContain("処理中");
+  expect(duplicate.views[0]!.content).toBe("再送待ちの判断を承認に変更しました");
   f.reopen(); f.setReviewStatus(200); f.setReviewFailure("none");
   const owner = interaction(draft.id, "approved", "100", ownerId); await f.review.handle(owner.i);
   expect(owner.views[0]!.content).toContain("承認しました");
@@ -410,7 +508,7 @@ test("同じ人の押し直しは本人の判断だけを上書きし再送時�
   const other = f.deliveries.decision(draft.id, userId)!;
   const before = f.calls.length;
   const repeated = interaction(draft.id, "rejected", "100", ownerId); await f.review.handle(repeated.i);
-  expect(repeated.views[0]!.content).toContain("処理中");
+  expect(repeated.views[0]!.content).toBe("再送待ちの判断を却下に変更しました");
   expect(f.calls).toHaveLength(before);
   expect(f.deliveries.decision(draft.id, ownerId)).toMatchObject({ decision: "rejected", attempts: 1, next_at: 1300 });
   expect(f.deliveries.decision(draft.id, userId)).toEqual(other);

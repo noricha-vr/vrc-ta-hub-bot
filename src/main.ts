@@ -70,7 +70,7 @@ async function main(): Promise<void> {
     const api = new HubApi(config.hubBaseUrl, config.hubApiKey);
     const review = new HubReview(gateway, opened, extracted, deliveries, api, log);
     const work = new HubPipeline(opened, extracted, gateway, new JevJudge(config.jevApiKey), api, review, log);
-    const hub = new HubSetup(gateway, opened, api, () => bot?.refreshChannels(), log);
+    const hub = new HubSetup(gateway, opened, api, () => bot?.refreshChannels(), log, Date.now, review);
     bot = new HubBot(gateway, store, {
       channelIds: () => opened.channelIds(),
       baseline: channelId => opened.baseline(channelId),
