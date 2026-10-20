@@ -62,6 +62,14 @@ interface DraftRow {
   materials: string;
 }
 
+export interface PostReviewNotification {
+  message_id: string;
+  guild_id: string;
+  community_id: number;
+  notified: number;
+  closed: number;
+}
+
 /** 抽出済みの項目と出典だけを保存する。受信箱とは独立し、本文の列を持たない。 */
 export class ExtractionStore {
   private readonly db: Database;
@@ -99,6 +107,13 @@ export class ExtractionStore {
         attempts INTEGER NOT NULL,
         next_at INTEGER NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('retry', 'review'))
+      );
+      CREATE TABLE IF NOT EXISTS post_review_notifications (
+        message_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        community_id INTEGER NOT NULL,
+        notified INTEGER NOT NULL DEFAULT 0,
+        closed INTEGER NOT NULL DEFAULT 0
       );
     `);
   }
@@ -217,6 +232,31 @@ export class ExtractionStore {
     return this.db.query<PendingRow, [number, number]>(
       "SELECT * FROM pending_posts WHERE state = 'retry' AND next_at <= ? ORDER BY next_at, length(message_id), message_id LIMIT ?",
     ).all(nowSeconds, limit).map(toPending);
+  }
+
+  reviewPosts(): PendingPost[] {
+    return this.db.query<PendingRow, []>("SELECT * FROM pending_posts WHERE state = 'review' ORDER BY rowid")
+      .all().map(toPending);
+  }
+
+  reviewNotification(messageId: string): PostReviewNotification | undefined {
+    return this.db.query<PostReviewNotification, [string]>("SELECT * FROM post_review_notifications WHERE message_id = ?")
+      .get(messageId) ?? undefined;
+  }
+
+  reserveReviewNotification(messageId: string, guildId: string, communityId: number): void {
+    this.db.query("INSERT OR IGNORE INTO post_review_notifications (message_id, guild_id, community_id) VALUES (?, ?, ?)")
+      .run(messageId, guildId, communityId);
+  }
+
+  markReviewNotified(messageId: string): void {
+    this.db.query("UPDATE post_review_notifications SET notified = 1 WHERE message_id = ?").run(messageId);
+  }
+
+  /** 閉じた記録も残し、同じ投稿の再取り込みで通知し直さない。 */
+  closeReview(messageId: string): boolean {
+    return this.db.query("UPDATE post_review_notifications SET closed = 1 WHERE message_id = ? AND closed = 0")
+      .run(messageId).changes > 0;
   }
 
   /** 同じ発表者の投稿で、まだ再試行待ちのもの（応募の可能性がある）。応募待ちの続報同士は数えない。 */

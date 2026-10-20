@@ -15,6 +15,7 @@ interface BotOptions {
   work?: { run(channelReady: (channelId: string) => boolean): Promise<void>; review: {
     handle(interaction: HubInteraction): Promise<void>;
     pendingReviews?(): HubReviewStats;
+    pendingPostReviews?(): number;
   } };
   healthPath: string;
   envFilePath?: string;
@@ -52,7 +53,7 @@ export class HubBot {
       startedAt, updatedAt: startedAt, lastReceivedAt: null,
       connectionState: "connecting", reconnectCount: 0, recoveredMessageCount: 0,
       pendingChannelCount: this.pending.size, lastSuccessfulSyncAt: null, lastErrorAt: null,
-      pendingReviewCount: 0, oldestPendingReviewAgeSeconds: 0,
+      pendingReviewCount: 0, pendingPostReviewCount: 0, oldestPendingReviewAgeSeconds: 0,
     };
   }
 
@@ -249,6 +250,7 @@ export class HubBot {
     try {
       const reviews = this.options.work?.review.pendingReviews?.();
       this.health.pendingReviewCount = reviews?.count ?? 0;
+      this.health.pendingPostReviewCount = this.options.work?.review.pendingPostReviews?.() ?? 0;
       this.health.oldestPendingReviewAgeSeconds = reviews?.oldestAgeSeconds ?? 0;
       writeHealth(this.options.healthPath, this.health);
     } catch {

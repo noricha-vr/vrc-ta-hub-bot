@@ -5,6 +5,7 @@ import { httpUrl } from "./extraction-fields";
 import type { ExtractionStore, PostReference, TalkDraft } from "./extraction-store";
 import type { HubSetting, HubStore, NotificationTarget } from "./hub-store";
 import type { HubInteraction, HubView } from "./hub-setup";
+import type { HubPostReview } from "./hub-post-review";
 
 export interface HubReviewGateway {
   notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void>;
@@ -27,6 +28,7 @@ export class HubReview {
     private readonly hub: HubReviewApi,
     private readonly log: (event: string) => void = () => {},
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
+    private readonly posts?: HubPostReview,
   ) {}
 
   private setting(row: HubDelivery): HubSetting | undefined {
@@ -70,6 +72,9 @@ export class HubReview {
   pendingReviews(guildId?: string, communityId?: number) {
     return this.deliveries.pendingReviews(this.now(), guildId, communityId);
   }
+  pendingPostReviews(guildId?: string, communityId?: number): number {
+    return this.posts?.count(guildId, communityId) ?? 0;
+  }
   private async lock(id: string): Promise<() => void> {
     const previous = this.busy.get(id);
     let release!: () => void;
@@ -108,6 +113,7 @@ export class HubReview {
         this.log("hub_review_retry");
       } finally { unlock(); }
     }
+    await this.posts?.flush();
   }
 
   private fields(draft: TalkDraft, event: number): HubDetailFields {
@@ -260,6 +266,7 @@ export class HubReview {
   }
 
   async handle(i: HubInteraction): Promise<void> {
+    if (i.action.endsWith(":ignore") && this.posts) { await this.posts.handle(i); return; }
     let unlock: (() => void) | undefined;
     try {
       await i.defer();

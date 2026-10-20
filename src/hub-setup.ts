@@ -57,7 +57,7 @@ export class HubSetup {
     private readonly changed: () => void,
     private readonly log: (event: string) => void = () => {},
     private readonly now: () => number = Date.now,
-    private readonly review?: Pick<HubReview, "pendingReviews">,
+    private readonly review?: Pick<HubReview, "pendingReviews"> & Partial<Pick<HubReview, "pendingPostReviews">>,
   ) {}
 
   async handle(interaction: HubInteraction): Promise<void> {
@@ -203,7 +203,8 @@ export class HubSetup {
       const drafts = this.store.drafts(s.guildId, community.id);
       const notification = setting.notification.type === "dm" ? "主催・スタッフへの DM" : `<#${setting.notification.channelId}>`;
       const reviews = this.review?.pendingReviews(s.guildId, community.id);
-      await i.edit(text(`${safeName(community.name)}：${setting.paused ? "一時停止中" : "読み取り中"}\nチャンネル：${setting.channelIds.map(id => `<#${id}>`).join("、")}\n通知先：${notification}\n判断の再送待ち：${reviews?.count ?? 0} 件（最古の待ち時間：${reviews?.oldestAgeSeconds ?? 0} 秒）\n最近の下書き：\n${drafts.length ? drafts.map(d => `${d.approved ? "承認済み" : "未承認"} ${d.sourceUrl}`).join("\n") : "まだありません。"}`));
+      const posts = this.review?.pendingPostReviews?.(s.guildId, community.id) ?? 0;
+      await i.edit(text(`${safeName(community.name)}：${setting.paused ? "一時停止中" : "読み取り中"}\nチャンネル：${setting.channelIds.map(id => `<#${id}>`).join("、")}\n通知先：${notification}\n確認待ちの投稿：${posts} 件\n判断の再送待ち：${reviews?.count ?? 0} 件（最古の待ち時間：${reviews?.oldestAgeSeconds ?? 0} 秒）\n最近の下書き：\n${drafts.length ? drafts.map(d => `${d.approved ? "承認済み" : "未承認"} ${d.sourceUrl}`).join("\n") : "まだありません。"}`));
       return;
     }
     if (s.action === "pause") {

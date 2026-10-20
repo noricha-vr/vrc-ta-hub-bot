@@ -10,6 +10,7 @@ import { HubSetup } from "./hub-setup";
 import { ExtractionStore } from "./extraction-store";
 import { HubDeliveryStore } from "./hub-delivery-store";
 import { HubReview } from "./hub-review";
+import { HubPostReview } from "./hub-post-review";
 import { HubPipeline } from "./hub-pipeline";
 import { JevJudge } from "./jev";
 
@@ -68,7 +69,8 @@ async function main(): Promise<void> {
     setInterval(() => { try { opened.purge(INBOX_MAX_AGE_SECONDS); } catch { log("inbox_purge_failed"); } }, INBOX_PURGE_INTERVAL_MS).unref();
     const gateway = new DiscordGateway();
     const api = new HubApi(config.hubBaseUrl, config.hubApiKey);
-    const review = new HubReview(gateway, opened, extracted, deliveries, api, log);
+    const posts = new HubPostReview(gateway, opened, extracted, api, log);
+    const review = new HubReview(gateway, opened, extracted, deliveries, api, log, undefined, posts);
     const work = new HubPipeline(opened, extracted, gateway, new JevJudge(config.jevApiKey), api, review, log);
     const hub = new HubSetup(gateway, opened, api, () => bot?.refreshChannels(), log, Date.now, review);
     bot = new HubBot(gateway, store, {
