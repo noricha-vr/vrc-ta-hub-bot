@@ -55,15 +55,15 @@ const quotedTitle = (text: string, pattern = QUOTED): string | undefined => {
 /**
  * 選ばれた行から題名だけを切り出す。次の規則に一致しなければ undefined（review）。
  * (a)「X」『X』"X"“X” (b) ラベル＋区切り＋X（X に句点・終止符・引用符なし） (c) ラベル＋区切り＋引用。
- * (d) 行の中に「X」または『X』が 1 組だけある時は、その中身を採る。
+ * (d) ラベル＋区切りがなく、行の中に「X」または『X』が 1 組だけある時は、その中身を採る。
  * 判定の前に前後の空白と末尾の「。」1 つだけを除く。
  */
 export function extractTitle(line: string): string | undefined {
   const text = line.trim().replace(/。$/, "").trim();
   const label = LABELLED.exec(text)?.[1]?.trim();
-  const title = quotedTitle(text)
-    ?? (label === undefined ? undefined : quotedTitle(label) ?? (PLAIN_FORBIDDEN.test(label) ? undefined : label))
-    ?? quotedTitle(text, INLINE_QUOTED);
+  const title = label === undefined
+    ? quotedTitle(text) ?? quotedTitle(text, INLINE_QUOTED)
+    : quotedTitle(label) ?? (PLAIN_FORBIDDEN.test(label) ? undefined : label);
   if (!title || [...title].length > MAX_TITLE_LENGTH || UNSAFE.test(title)) return undefined;
   return title;
 }

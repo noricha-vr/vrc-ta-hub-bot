@@ -314,6 +314,16 @@ test("1 行の投稿で引用が行の途中にある時は題名だけを採り
   expect(JSON.stringify(result)).not.toContain(marker);
   expect(JSON.stringify(f.store.forMessage(item.id))).not.toContain(marker);
   expect(f.store.counts().drafts).toBe(1);
+  if (result.status !== "candidate") throw new Error("Expected a candidate");
+  f.store.close();
+  const reopened = new ExtractionStore(f.path);
+  try {
+    const extractor = new PostExtractor(f.judge, reopened, async () => ["2026-10-23"]);
+    const calls = f.judge.requests.length;
+    expect(await extractor.extract("meeting-1", item)).toEqual({ status: "duplicate", draft: result.draft });
+    expect(f.judge.requests).toHaveLength(calls);
+    expect(reopened.counts()).toEqual({ drafts: 1, sourcePosts: 1 });
+  } finally { reopened.close(); }
 });
 
 test("ラベル直後の引用を含む 1 行の応募から題名を切り出す", async () => {
@@ -331,6 +341,7 @@ for (const [content, label] of [
   ["10/23 に応募します。型の話をします。私的な連絡もここに書きます", "切り出せない 1 行"],
   [`10/23 に応募\n題名: ${"長".repeat(81)}`, "80 字超の題名"],
   ["10/23 に応募します。タイトル「型の話」、補足は「Bun の話」です", "引用が 2 組ある 1 行"],
+  ["10/23 に応募\n題名: 型の話。後で「PRIVATE-NOTE」について連絡します", "ラベル付き題名と文中引用が食い違う行"],
 ] as const) {
   test(`${label}は下書きにせず確認対象にする`, async () => {
     const f = fixture(); const item = post("100", content); f.inbox.save(item);
@@ -495,6 +506,7 @@ test("応募の再試行中に届いた続報は保留し、応募の後に処�
 
 test("ラベルの後に別の文が続く題名は採らず、ラベルと題名だけの行は採る", async () => {
   expect(extractTitle("題名: 型の話。PRIVATE-NOTE の件は後で連絡します")).toBeUndefined();
+  expect(extractTitle("題名: 型の話。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
   expect(extractTitle("題名: 「型の話」。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
   expect(extractTitle("題名: 型の話、あと懇親会は欠席です")).toBeUndefined();
   expect(extractTitle("Title: Types, see you")).toBeUndefined();
