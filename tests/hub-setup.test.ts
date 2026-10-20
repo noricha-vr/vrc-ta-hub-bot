@@ -240,7 +240,9 @@ test("more than 25 communities have paginated menus and the staff selection reta
   let menu = await f.interact("setup");
   const buttonRow = menu.controls[1]!;
   if (buttonRow.type !== "buttons") throw new Error();
-  menu = await f.interact(buttonRow.buttons[0]!.id, [], "component");
+  const next = buttonRow.buttons[0]!;
+  if (!("id" in next)) throw new Error();
+  menu = await f.interact(next.id, [], "component");
   menu = await f.select(menu, ["26"]); menu = await f.select(menu, ["10"]); await f.select(menu, ["dm"]);
   expect(f.store.settings()[0]?.community).toMatchObject({ id: 26, role: "staff", recording_allowed: true });
 });

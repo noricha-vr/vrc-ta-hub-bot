@@ -22,7 +22,9 @@ export function discordHubView(view: HubView) {
       new StringSelectMenuBuilder().setCustomId(control.id).setMinValues(1).setMaxValues(1).addOptions(control.options),
     );
     return new ActionRowBuilder<ButtonBuilder>().addComponents(control.buttons.map(button =>
-      new ButtonBuilder().setCustomId(button.id).setLabel(button.label).setStyle(ButtonStyle.Secondary)));
+      "url" in button
+        ? new ButtonBuilder().setURL(button.url).setLabel(button.label).setStyle(ButtonStyle.Link)
+        : new ButtonBuilder().setCustomId(button.id).setLabel(button.label).setStyle(ButtonStyle.Secondary)));
   });
   return { content: view.content, components, allowedMentions: { parse: [] as never[], repliedUser: false } };
 }
@@ -30,7 +32,7 @@ export function discordHubView(view: HubView) {
 export function hubInteraction(interaction: Interaction): HubInteraction | undefined {
   const command = interaction.isChatInputCommand() && interaction.commandName === "hub";
   const component = (interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isButton())
-    && interaction.customId.startsWith("hub:");
+    && (interaction.customId.startsWith("hub:") || interaction.customId.startsWith("hub-review:"));
   if (!command && !component) return;
   // Narrow again to keep the Discord interaction boundary fully typed.
   if (!(interaction.isChatInputCommand() || interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isButton())) return;
@@ -40,7 +42,7 @@ export function hubInteraction(interaction: Interaction): HubInteraction | undef
     action: interaction.isChatInputCommand() ? interaction.options.getSubcommand() : interaction.customId,
     values: interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() ? interaction.values : [],
     defer: async () => {
-      if (interaction.isChatInputCommand()) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (interaction.isChatInputCommand() || interaction.customId.startsWith("hub-review:")) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       else await interaction.deferUpdate();
     },
     edit: async view => { await interaction.editReply(discordHubView(view)); },

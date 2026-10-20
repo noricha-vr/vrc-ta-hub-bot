@@ -5,7 +5,7 @@ import { HubStore, type NotificationTarget } from "./hub-store";
 export type HubControl =
   | { type: "select"; id: string; options: Array<{ label: string; value: string }> }
   | { type: "channels"; id: string; multiple: boolean }
-  | { type: "buttons"; buttons: Array<{ id: string; label: string }> };
+  | { type: "buttons"; buttons: Array<{ id: string; label: string } | { url: string; label: string }> };
 export interface HubView { content: string; controls: HubControl[] }
 export interface HubInteraction {
   guildId: string | null;

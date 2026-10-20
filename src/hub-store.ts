@@ -63,6 +63,14 @@ export class HubStore extends MessageStore {
     }));
   }
 
+  messageSettings(channelId: string, messageId: string): HubSetting[] {
+    const rows = this.db.query<{ guild_id: string; community_id: number; baseline: string }, [string]>(
+      "SELECT guild_id, community_id, baseline FROM hub_channels WHERE channel_id = ?",
+    ).all(channelId);
+    return this.settings().filter(s => !s.paused && rows.some(row => row.guild_id === s.guildId
+      && row.community_id === s.community.id && compareIds(messageId, row.baseline) > 0));
+  }
+
   channelIds(): string[] {
     return this.db.query<{ channel_id: string }, []>(`SELECT DISTINCT c.channel_id FROM hub_channels c
       JOIN hub_settings s USING (guild_id, community_id) WHERE s.paused = 0 ORDER BY c.channel_id`)

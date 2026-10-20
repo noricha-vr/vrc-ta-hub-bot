@@ -318,3 +318,31 @@ test("recovery caps each channel at 20 pages and lets other channels progress", 
   expect(f.store.messages("10")).toHaveLength(2050);
   expect(f.health().pendingChannelCount).toBe(0);
 });
+
+test("受信と補完から後続処理を起動し、承認操作と送信処理の完了を待ってから停止する", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hub-worker-test-"));
+  const store = new MessageStore(join(dir, "state.sqlite"));
+  const gateway = new FakeGateway();
+  let workCalls = 0;
+  let finishWork: () => void = () => {};
+  let finishReview: () => void = () => {};
+  let reviewCalls = 0;
+  const work = {
+    run: async () => { workCalls++; await new Promise<void>(resolve => { finishWork = resolve; }); },
+    review: { handle: async () => { reviewCalls++; await new Promise<void>(resolve => { finishReview = resolve; }); } },
+  };
+  const bot = new HubBot(gateway, store, { channelIds: ["10"], work, healthPath: join(dir, "health.json") });
+  cleanups.push(async () => { finishWork(); finishReview(); await bot.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); });
+  await bot.start("fake"); await bot.reconcile();
+  expect(workCalls).toBe(1);
+  gateway.events!.message(message("101"));
+  expect(workCalls).toBe(1);
+  gateway.events!.interaction!({ guildId: null, userId: "20", kind: "component", action: "hub-review:token:approved", values: [],
+    defer: async () => {}, edit: async () => {}, followUp: async () => {} });
+  expect(reviewCalls).toBe(1);
+  let stopped = false;
+  const stopping = bot.stop().then(() => { stopped = true; });
+  await Promise.resolve(); expect(stopped).toBe(false); expect(gateway.stopped).toBe(false);
+  finishWork(); finishReview(); await stopping;
+  expect(stopped).toBe(true); expect(gateway.stopped).toBe(true);
+});

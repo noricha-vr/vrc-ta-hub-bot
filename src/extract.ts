@@ -279,9 +279,10 @@ function unrefetched(store: ExtractionStore, inbox: Inbox, pending: PendingPost,
 export async function processDueRetries(
   extractor: PostExtractor, inbox: Inbox, gateway: Pick<Gateway, "fetchMessages">,
   now = nowSeconds(),
+  selected: (pending: PendingPost) => boolean = () => true,
 ): Promise<ExtractionResult[]> {
   const results: ExtractionResult[] = [];
-  for (const pending of extractor.store.dueRetries(now)) {
+  for (const pending of extractor.store.dueRetries(now, Number.MAX_SAFE_INTEGER).filter(selected).slice(0, 50)) {
     try {
       results.push(await retryOne(extractor, inbox, gateway, pending, now));
     } catch {

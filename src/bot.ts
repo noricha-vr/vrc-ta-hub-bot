@@ -1,4 +1,4 @@
-import type { HubSetup } from "./hub-setup";
+import type { HubSetup, HubInteraction } from "./hub-setup";
 import type { Gateway, GatewayMessage } from "./gateway";
 import { compareIds } from "./gateway";
 import { type Health, writeHealth } from "./health";
@@ -11,6 +11,7 @@ interface BotOptions {
   channelIds: string[] | (() => string[]);
   baseline?: (channelId: string) => string;
   hub?: HubSetup;
+  work?: { run(): Promise<void>; review: { handle(interaction: HubInteraction): Promise<void> } };
   healthPath: string;
   heartbeatMs?: number;
   now?: () => Date;
@@ -31,6 +32,8 @@ export class HubBot {
   private epoch = 0;
   private active: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private workTask: Promise<void> | undefined;
+  private readonly interactions = new Set<Promise<void>>();
   private unsubscribe: (() => void) | undefined;
 
   constructor(private readonly gateway: Gateway, private readonly store: MessageStore, private readonly options: BotOptions) {
@@ -61,7 +64,14 @@ export class HubBot {
       disconnected: () => this.offline("disconnected"),
       reconnecting: () => this.offline("reconnecting"),
       message: message => this.receive(message),
-      interaction: interaction => { void this.options.hub?.handle(interaction); },
+      interaction: interaction => {
+        if (this.stopped) return;
+        const handler = interaction.action.startsWith("hub-review:") ? this.options.work?.review : this.options.hub;
+        if (!handler) return;
+        const task = handler.handle(interaction).catch(() => this.recordError("hub_interaction_failed"));
+        this.interactions.add(task);
+        void task.finally(() => this.interactions.delete(task));
+      },
       guildDelete: guildId => {
         try { this.options.hub?.guildDeleted(guildId); }
         catch { this.recordError("hub_guild_delete_failed"); }
@@ -81,6 +91,7 @@ export class HubBot {
     this.timer = setInterval(() => {
       this.publish();
       void this.reconcile();
+      this.processWork();
     }, this.options.heartbeatMs ?? 5000);
     try {
       await this.gateway.start(token);
@@ -129,6 +140,7 @@ export class HubBot {
       this.recordError("message_store_failed");
     }
     this.publish();
+    this.processWork();
   }
 
   /** Also used by the periodic retry; overlapping ready/resume events are coalesced. */
@@ -160,6 +172,13 @@ export class HubBot {
       this.health.lastSuccessfulSyncAt = this.now().toISOString();
     }
     this.publish();
+    this.processWork();
+  }
+
+  private processWork(): void {
+    if (!this.connected || this.stopped || this.workTask || !this.options.work) return;
+    this.workTask = this.options.work.run().catch(() => this.recordError("hub_pipeline_failed"))
+      .finally(() => { this.workTask = undefined; });
   }
 
   private failureGeneration(channelId: string): number {
@@ -234,6 +253,7 @@ export class HubBot {
     clearInterval(this.timer);
     this.unsubscribe?.();
     try {
+      await Promise.allSettled([this.active, this.workTask, ...this.interactions]);
       await this.gateway.stop();
     } finally {
       this.health.connectionState = failed ? "error" : "stopped";
