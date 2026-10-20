@@ -10,6 +10,8 @@ export interface Health {
   reconnectCount: number;
   recoveredMessageCount: number;
   pendingChannelCount: number;
+  pendingReviewCount: number;
+  oldestPendingReviewAgeSeconds: number;
   lastSuccessfulSyncAt: string | null;
   lastErrorAt: string | null;
 }

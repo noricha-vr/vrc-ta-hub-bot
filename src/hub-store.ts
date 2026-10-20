@@ -38,6 +38,10 @@ export class HubStore extends MessageStore {
         source_url TEXT NOT NULL, created_at TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS hub_pending_leaves (guild_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS hub_reviewers (
+        guild_id TEXT NOT NULL, community_id INTEGER NOT NULL, discord_id TEXT NOT NULL,
+        PRIMARY KEY (guild_id, community_id, discord_id)
+      );
     `);
     const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(hub_channels)").all();
     if (!columns.some(column => column.name === "cursor")) {
@@ -61,6 +65,14 @@ export class HubStore extends MessageStore {
         "SELECT channel_id FROM hub_channels WHERE guild_id = ? AND community_id = ? ORDER BY channel_id",
       ).all(row.guild_id, row.community_id).map(channel => channel.channel_id),
     }));
+  }
+
+  messageSettings(channelId: string, messageId: string): HubSetting[] {
+    const rows = this.db.query<{ guild_id: string; community_id: number; baseline: string }, [string]>(
+      "SELECT guild_id, community_id, baseline FROM hub_channels WHERE channel_id = ?",
+    ).all(channelId);
+    return this.settings().filter(s => !s.paused && rows.some(row => row.guild_id === s.guildId
+      && row.community_id === s.community.id && compareIds(messageId, row.baseline) > 0));
   }
 
   channelIds(): string[] {
@@ -93,7 +105,7 @@ export class HubStore extends MessageStore {
     }
   }
 
-  configure(setting: Omit<HubSetting, "paused">, baseline: string): void {
+  configure(setting: Omit<HubSetting, "paused">, baseline: string, reviewerId?: string): void {
     if (!setting.channelIds.length || setting.channelIds.length > 25) throw new Error("Invalid channel selection");
     this.db.transaction(() => {
       this.db.query("DELETE FROM hub_pending_leaves WHERE guild_id = ?").run(setting.guildId);
@@ -103,6 +115,8 @@ export class HubStore extends MessageStore {
       this.db.query(`INSERT INTO hub_settings (guild_id, community_id, community, notification, paused) VALUES (?, ?, ?, ?, 0)
         ON CONFLICT (guild_id, community_id) DO UPDATE SET community = excluded.community, notification = excluded.notification, paused = 0`)
         .run(setting.guildId, setting.community.id, JSON.stringify(setting.community), JSON.stringify(setting.notification));
+      if (reviewerId) this.db.query("INSERT OR IGNORE INTO hub_reviewers (guild_id, community_id, discord_id) VALUES (?, ?, ?)")
+        .run(setting.guildId, setting.community.id, reviewerId);
       this.db.query("DELETE FROM hub_channels WHERE guild_id = ? AND community_id = ?").run(setting.guildId, setting.community.id);
       for (const id of new Set(setting.channelIds)) {
         const prior = old.find(row => row.channel_id === id);
@@ -135,6 +149,14 @@ export class HubStore extends MessageStore {
   leave(guildId: string, communityId?: number, pendingLeaveIfEmpty = false): void {
     this.db.transaction(() => {
       const settings = this.settings(guildId).filter(setting => communityId === undefined || setting.community.id === communityId);
+      if (this.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hub_deliveries'").get()) {
+        this.db.query(`DELETE FROM hub_review_decisions WHERE draft_id IN (
+          SELECT draft_id FROM hub_deliveries WHERE guild_id = ? AND (? IS NULL OR community_id = ?)
+        )`).run(guildId, communityId ?? null, communityId ?? null);
+        this.db.query(`UPDATE hub_deliveries SET state = 'closed', reason = 'setting_removed', decision = NULL, discord_id = NULL
+          WHERE state <> 'closed' AND guild_id = ? AND (? IS NULL OR community_id = ?)`)
+          .run(guildId, communityId ?? null, communityId ?? null);
+      }
       for (const setting of settings) {
         this.db.query("DELETE FROM hub_settings WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);
         this.db.query("DELETE FROM hub_channels WHERE guild_id = ? AND community_id = ?").run(guildId, setting.community.id);

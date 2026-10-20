@@ -160,3 +160,48 @@ test("components update the source message and send stale replies ephemerally", 
       { content: "このメニューは古くなりました。", components: [], allowedMentions: { parse: [], repliedUser: false }, flags: MessageFlags.Ephemeral }]);
   }
 });
+
+test("review buttons in DM and guild defer privately without changing the notification", async () => {
+  for (const guildId of [null, "100"]) {
+    const calls: unknown[] = [];
+    const raw = {
+      guildId, user: { id: "123456789012345678" }, customId: "hub-review:00000000-0000-0000-0000-000000000000:approved",
+      isChatInputCommand: () => false, isStringSelectMenu: () => false, isChannelSelectMenu: () => false, isButton: () => true,
+      deferReply: async (options: unknown) => { calls.push(options); },
+      deferUpdate: async () => { throw new Error("Must not edit notification"); },
+      editReply: async (options: unknown) => { calls.push(options); }, followUp: async () => {},
+    };
+    const interaction = hubInteraction(raw as unknown as Interaction)!;
+    expect(interaction.guildId).toBe(guildId);
+    await interaction.defer(); await interaction.edit({ content: "主催者ではありません。", controls: [] });
+    expect(calls).toEqual([{ flags: MessageFlags.Ephemeral },
+      { content: "主催者ではありません。", components: [], allowedMentions: { parse: [], repliedUser: false } }]);
+  }
+});
+
+test("edit button opens the hub URL and notification transports suppress all mentions", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  const sent: unknown[] = [];
+  const users: string[] = [];
+  const view = { content: "承認待ち", controls: [{ type: "buttons" as const, buttons: [
+    { id: "hub-review:token:approved", label: "承認" },
+    { url: "https://example.invalid/event/detail/42/update/", label: "直す" },
+  ] }] };
+  const payload = discordHubView(view);
+  expect(payload.components[0]!.toJSON().components[1]).toMatchObject({ style: 5, url: "https://example.invalid/event/detail/42/update/" });
+  let guildId = "100";
+  client.channels.fetch = (async () => ({ type: ChannelType.GuildText, get guildId() { return guildId; },
+    send: async (message: unknown) => { sent.push(message); } })) as unknown as typeof client.channels.fetch;
+  client.users.fetch = (async (id: string) => { users.push(id); return { send: async (message: unknown) => { sent.push(message); } }; }) as unknown as typeof client.users.fetch;
+  try {
+    await gateway.notify("100", { type: "channel", channelId: "11" }, view, "nonce-1");
+    await gateway.notify("100", { type: "dm", userId: "123456789012345678" }, view, "nonce-2");
+    expect(users).toEqual(["123456789012345678"]);
+    expect(sent).toHaveLength(2);
+    for (const message of sent) expect(message).toMatchObject({ allowedMentions: { parse: [], repliedUser: false }, enforceNonce: true });
+    guildId = "200";
+    await expect(gateway.notify("100", { type: "channel", channelId: "11" }, view, "nonce-3")).rejects.toThrow("configured guild");
+    expect(sent).toHaveLength(2);
+  } finally { await gateway.stop(); }
+});

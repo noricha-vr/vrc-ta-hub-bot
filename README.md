@@ -42,7 +42,7 @@ SDK の `allowedMentions: { parse: [], repliedUser: false }` でメンション�
 ## 集会での使い始め
 
 1. Bot をサーバーに招待する（View Channel・Read Message History・Send Messages）。
-2. ハブで主催かスタッフになっている人が `/hub setup` を実行し、集会・読むチャンネル・通知先を選ぶ。実行者と Bot の両方に、選んだチャンネルの閲覧と履歴の権限が要る。
+2. Hub で主催かスタッフになっている人が `/hub setup` を実行し、集会・読むチャンネル・通知先を選ぶ。実行者と Bot の両方に、選んだチャンネルの閲覧と履歴の権限が要る。
 3. `/hub status` で状態を確かめる。`/hub pause` で一時停止、`/hub leave` で設定と未承認の下書きを消す。最後の設定を外すと Bot はサーバーから退出する。
 
 ## 取りこぼしの補完

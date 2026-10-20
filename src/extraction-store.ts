@@ -115,6 +115,10 @@ export class ExtractionStore {
     };
   }
 
+  allDrafts(): TalkDraft[] {
+    return this.db.query<{ id: string }, []>("SELECT id FROM talk_drafts ORDER BY rowid").all().map(row => this.get(row.id)!);
+  }
+
   forPresenter(meetingId: string, presenterId: string): TalkDraft[] {
     return this.db.query<{ id: string }, [string, string]>(
       "SELECT id FROM talk_drafts WHERE meeting_id = ? AND presenter_id = ? ORDER BY event_date, id",

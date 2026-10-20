@@ -31,7 +31,7 @@ const classification: ChoiceQuestion = {
   },
 };
 
-/** 候補を返す部品。ハブ登録・通知・受信処理への自動接続は行わない。 */
+/** 候補を返す部品。Hub 登録・通知・受信処理への自動接続は行わない。 */
 export class PostExtractor {
   private readonly totals: Record<ExtractionResult["status"], number> = {
     candidate: 0, duplicate: 0, review: 0, unrelated: 0, retry: 0,
@@ -279,9 +279,10 @@ function unrefetched(store: ExtractionStore, inbox: Inbox, pending: PendingPost,
 export async function processDueRetries(
   extractor: PostExtractor, inbox: Inbox, gateway: Pick<Gateway, "fetchMessages">,
   now = nowSeconds(),
+  selected: (pending: PendingPost) => boolean = () => true,
 ): Promise<ExtractionResult[]> {
   const results: ExtractionResult[] = [];
-  for (const pending of extractor.store.dueRetries(now)) {
+  for (const pending of extractor.store.dueRetries(now, Number.MAX_SAFE_INTEGER).filter(selected).slice(0, 50)) {
     try {
       results.push(await retryOne(extractor, inbox, gateway, pending, now));
     } catch {

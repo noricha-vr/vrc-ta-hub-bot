@@ -1,5 +1,7 @@
-import { Client, Events, GatewayIntentBits, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
-import { hubCommand, hubInteraction, validateHubChannels } from "./discord-hub";
+import { Client, ChannelType, Events, GatewayIntentBits, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
+import type { NotificationTarget } from "./hub-store";
+import type { HubView } from "./hub-setup";
+import { discordHubView, hubCommand, hubInteraction, validateHubChannels } from "./discord-hub";
 import type { Gateway, GatewayEvents, GatewayMessage, HistoryQuery } from "./gateway";
 
 export const clientOptions: ClientOptions = {
@@ -112,6 +114,20 @@ export class DiscordGateway implements Gateway {
       if (keys.length < GUILD_PAGE) return ids;
       after = keys.reduce((max, id) => (BigInt(id) > BigInt(max) ? id : max));
     }
+  }
+
+  async notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void> {
+    const payload = { ...discordHubView(view), nonce, enforceNonce: true };
+    if (target.type === "dm") {
+      const user = await this.client.users.fetch(target.userId);
+      await user.send(payload);
+      return;
+    }
+    const channel = await this.client.channels.fetch(target.channelId);
+    if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) || channel.guildId !== guildId) {
+      throw new Error("Notification channel must belong to configured guild");
+    }
+    await channel.send(payload);
   }
 
   async validateChannels(guildId: string, channelIds: string[], purpose: "read" | "notify", userId: string): Promise<void> {

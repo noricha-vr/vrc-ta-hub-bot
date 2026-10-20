@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { HubCommunity, HubLookup } from "./hub-api";
 import { HubStore, type NotificationTarget } from "./hub-store";
+import type { HubReview } from "./hub-review";
 
 export type HubControl =
   | { type: "select"; id: string; options: Array<{ label: string; value: string }> }
   | { type: "channels"; id: string; multiple: boolean }
-  | { type: "buttons"; buttons: Array<{ id: string; label: string }> };
+  | { type: "buttons"; buttons: Array<{ id: string; label: string } | { url: string; label: string }> };
 export interface HubView { content: string; controls: HubControl[] }
 export interface HubInteraction {
   guildId: string | null;
@@ -56,6 +57,7 @@ export class HubSetup {
     private readonly changed: () => void,
     private readonly log: (event: string) => void = () => {},
     private readonly now: () => number = Date.now,
+    private readonly review?: Pick<HubReview, "pendingReviews">,
   ) {}
 
   async handle(interaction: HubInteraction): Promise<void> {
@@ -85,7 +87,7 @@ export class HubSetup {
     const communities = (await this.hub.communities(i.userId)).filter(c => c.role === "owner" || c.role === "staff");
     if (this.leaving.has(guildId) || revision !== this.revision(guildId)) { await i.edit(text("設定が変更されました。やり直してください。")); return; }
     const available = i.action === "setup" ? communities : communities.filter(c => this.store.settings(guildId).some(s => s.community.id === c.id));
-    if (!available.length) { await i.edit(text("操作できる主催・スタッフの集会がありません。ハブの登録と設定を確認してください。")); return; }
+    if (!available.length) { await i.edit(text("操作できる主催・スタッフの集会がありません。Hub の登録と設定を確認してください。")); return; }
     // One live wizard per person and guild. Expired menus can never overwrite new choices.
     for (const [token, session] of this.sessions) if (session.userId === i.userId && session.guildId === guildId) this.sessions.delete(token);
     if (this.sessions.size >= 500) { await i.edit(text("設定が混み合っています。しばらく待ってやり直してください。")); return; }
@@ -186,7 +188,7 @@ export class HubSetup {
     if (notification.type === "channel") await this.gateway.validateChannels(s.guildId, [notification.channelId], "notify", s.userId);
     if (!this.current(s)) throw new StaleMenuError();
     this.mutate(s.guildId, () => this.store.configure(
-      { guildId: s.guildId, community, channelIds: s.channelIds!, notification }, setupBaseline(this.now()),
+      { guildId: s.guildId, community, channelIds: s.channelIds!, notification }, setupBaseline(this.now()), s.userId,
     ));
     this.log("hub_setup_saved");
     await i.edit(text(`${safeName(community.name)} の設定を保存しました。設定時点より後の投稿を読み取ります。`));
@@ -200,7 +202,8 @@ export class HubSetup {
       this.sessions.delete(s.token);
       const drafts = this.store.drafts(s.guildId, community.id);
       const notification = setting.notification.type === "dm" ? "主催・スタッフへの DM" : `<#${setting.notification.channelId}>`;
-      await i.edit(text(`${safeName(community.name)}：${setting.paused ? "一時停止中" : "読み取り中"}\nチャンネル：${setting.channelIds.map(id => `<#${id}>`).join("、")}\n通知先：${notification}\n最近の下書き：\n${drafts.length ? drafts.map(d => `${d.approved ? "承認済み" : "未承認"} ${d.sourceUrl}`).join("\n") : "まだありません。"}`));
+      const reviews = this.review?.pendingReviews(s.guildId, community.id);
+      await i.edit(text(`${safeName(community.name)}：${setting.paused ? "一時停止中" : "読み取り中"}\nチャンネル：${setting.channelIds.map(id => `<#${id}>`).join("、")}\n通知先：${notification}\n判断の再送待ち：${reviews?.count ?? 0} 件（最古の待ち時間：${reviews?.oldestAgeSeconds ?? 0} 秒）\n最近の下書き：\n${drafts.length ? drafts.map(d => `${d.approved ? "承認済み" : "未承認"} ${d.sourceUrl}`).join("\n") : "まだありません。"}`));
       return;
     }
     if (s.action === "pause") {

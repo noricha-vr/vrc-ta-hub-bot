@@ -7,6 +7,7 @@ import { HubBot } from "../src/bot";
 import type { HubCommunity } from "../src/hub-api";
 import { HubSetup, setupBaseline, type HubInteraction, type HubView } from "../src/hub-setup";
 import { HubStore } from "../src/hub-store";
+import { HubDeliveryStore } from "../src/hub-delivery-store";
 import { FakeGateway, message } from "./fake-gateway";
 
 const userId = "123456789012345678";
@@ -19,6 +20,7 @@ function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "hub-setup-"));
   const path = join(dir, "state.sqlite");
   const store = new HubStore(path);
+  const deliveries = new HubDeliveryStore(path);
   const gateway = new FakeGateway();
   const logs: string[] = [];
   let memberships: HubCommunity[] = [owner, staff];
@@ -27,10 +29,11 @@ function fixture() {
   let bot: HubBot;
   const hub = new HubSetup(gateway, store, { communities: async id => {
     expect(id).toBe(userId); await lookup?.(); return memberships;
-  } }, () => bot.refreshChannels(), event => logs.push(event), () => now);
+  } }, () => bot.refreshChannels(), event => logs.push(event), () => now,
+  { pendingReviews: (guildId, communityId) => deliveries.pendingReviews(Math.floor(now / 1000), guildId, communityId) });
   bot = new HubBot(gateway, store, { channelIds: () => store.channelIds(), baseline: id => store.baseline(id), hub,
     healthPath: join(dir, "health.json"), log: event => logs.push(event), heartbeatMs: 60000 });
-  cleanups.push(async () => { await bot.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); });
+  cleanups.push(async () => { await bot.stop(); deliveries.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   async function interact(action: string, values: string[] = [], kind: "command" | "component" = "command", overrides: Partial<HubInteraction> = {}): Promise<HubView> {
     let result: HubView | undefined;
     let deferred = false;
@@ -55,7 +58,7 @@ function fixture() {
     return view;
   }
   async function action(action: string, communityId = 1) { return select(await interact(action), [String(communityId)]); }
-  return { dir, path, store, gateway, bot, hub, logs, interact, select, setup, action,
+  return { dir, path, store, deliveries, gateway, bot, hub, logs, interact, select, setup, action,
     setMemberships: (value: HubCommunity[]) => { memberships = value; },
     setLookup: (value: (() => Promise<void>) | undefined) => { lookup = value; },
     tick: (ms: number) => { now += ms; }, baseline: () => setupBaseline(now) };
@@ -136,6 +139,20 @@ test("pause stops reads and setup resumes; status includes channels and recent d
   expect(f.store.settings()[0]?.paused).toBe(false);
 });
 
+test("status は選んだサーバー・集会の保留の行数と最古の経過秒数だけを表示する", async () => {
+  const f = fixture(); await f.setup(["10"]);
+  for (const [id, guildId, communityId] of [["first", "100", 1], ["second", "100", 1],
+    ["other-community", "100", 2], ["other-guild", "200", 1]] as const) {
+    f.deliveries.enqueue(id, guildId, communityId); f.deliveries.created(id, 42, "hash");
+    f.deliveries.queueDecision(id, "approved", userId, Date.parse("2026-10-19T00:00:00Z") / 1000);
+  }
+  f.deliveries.queueDecision("second", "rejected", "223456789012345678", Date.parse("2026-10-19T00:00:10Z") / 1000);
+  f.tick(90000);
+  expect((await f.action("status")).content).toContain("判断の再送待ち：3 件（最古の待ち時間：90 秒）");
+  f.deliveries.closed("first", "approved"); f.deliveries.closed("second", "rejected");
+  expect((await f.action("status")).content).toContain("判断の再送待ち：0 件（最古の待ち時間：0 秒）");
+});
+
 test("leave deletes settings, unapproved drafts, cursors and inbox, then leaves the last guild", async () => {
   const f = fixture(); await f.setup(["10"]);
   f.store.saveDraft(draft("pending")); f.store.saveDraft(draft("approved", true));
@@ -171,6 +188,30 @@ test("guildDelete removes every community and only unapproved drafts in that gui
   expect(f.store.drafts("100", 1).map(d => d.id)).toEqual(["approved"]);
   expect(f.store.drafts("100", 2)).toEqual([]); expect(f.store.drafts("200", 1)).toHaveLength(1);
   expect(f.store.cursor("10")).toBe("0"); expect(f.gateway.leftGuilds).toEqual([]);
+});
+
+for (const action of ["leave", "guildDelete"]) test(`${action} closes only the removed settings' deliveries and clears their pending reviews`, async () => {
+  const f = fixture(); await f.bot.start("fake"); await f.setup(["10"]); await f.setup(["11"], 2);
+  f.store.configure({ guildId: "200", community: owner, channelIds: ["20"], notification: { type: "dm", userId } }, f.baseline());
+  for (const [id, guildId, communityId] of [["first", "100", 1], ["second", "100", 2], ["other", "200", 1]] as const) {
+    f.deliveries.enqueue(id, guildId, communityId); f.deliveries.created(id, 42, "hash");
+    f.deliveries.queueDecision(id, "approved", userId, 1000); f.deliveries.retryDecision(id, userId, 1000);
+  }
+  f.deliveries.enqueue("queued", "100", 1);
+  f.deliveries.enqueue("creating", "100", 1); f.deliveries.creating("creating", "hash");
+  if (action === "leave") await f.action("leave");
+  else f.gateway.events!.guildDelete!("100");
+  expect(f.deliveries.get("first")?.state).toBe("closed");
+  expect(f.deliveries.get("queued")?.state).toBe("closed");
+  expect(f.deliveries.get("creating")?.state).toBe("closed");
+  expect(f.deliveries.decisions("first")).toEqual([]);
+  expect(f.deliveries.get("second")?.state).toBe(action === "leave" ? "ready" : "closed");
+  expect(f.deliveries.decisions("second")).toHaveLength(action === "leave" ? 1 : 0);
+  expect(f.deliveries.get("other")?.state).toBe("ready");
+  expect(f.deliveries.decisions("other")).toHaveLength(1);
+  expect(f.deliveries.pendingReviews(1100).count).toBe(action === "leave" ? 2 : 1);
+  await f.setup(["10"]);
+  expect((await f.action("status")).content).toContain("判断の再送待ち：0 件（最古の待ち時間：0 秒）");
 });
 
 test("channel permission failure or revoked membership cannot commit settings", async () => {
@@ -240,7 +281,9 @@ test("more than 25 communities have paginated menus and the staff selection reta
   let menu = await f.interact("setup");
   const buttonRow = menu.controls[1]!;
   if (buttonRow.type !== "buttons") throw new Error();
-  menu = await f.interact(buttonRow.buttons[0]!.id, [], "component");
+  const next = buttonRow.buttons[0]!;
+  if (!("id" in next)) throw new Error();
+  menu = await f.interact(next.id, [], "component");
   menu = await f.select(menu, ["26"]); menu = await f.select(menu, ["10"]); await f.select(menu, ["dm"]);
   expect(f.store.settings()[0]?.community).toMatchObject({ id: 26, role: "staff", recording_allowed: true });
 });
