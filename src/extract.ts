@@ -1,4 +1,4 @@
-import { extractMaterials, extractTitle, httpUrl, resolveEventDate, validEventDate, type Material } from "./extraction-fields";
+import { extractMaterials, extractTitle, hasTitleLine, httpUrl, MAX_TITLE_LENGTH, resolveEventDate, validEventDate, type Material } from "./extraction-fields";
 import { type ExtractionStore, type PendingPost, type PostReference, type SavedDraft, type TalkDraft } from "./extraction-store";
 import type { Gateway, GatewayMessage } from "./gateway";
 import { JudgeError, validAnswer, type ChoiceAnswer, type ChoiceQuestion, type Judge } from "./jev";
@@ -96,12 +96,31 @@ export class PostExtractor {
     const prior = this.store.forMessage(message.id);
     if (prior) return { status: "duplicate", draft: prior };
     if (!meetingId.trim() || !message.authorDisplayName?.trim() || !source.url) return review("missing_metadata");
-    const category = await this.tryChoose(message.content, "classification", classification);
+    const materials = extractMaterials(message.content, message.attachments);
+    let question = classification;
+    if (materials.length > 0 && !hasTitleLine(message.content)) {
+      // 投稿日は開催日と同じ日本時間。古い応募・件数・題名の長さを制限し、分類の入力を抑える。
+      const posted = Date.parse(message.createdAt);
+      const since = Number.isFinite(posted)
+        ? new Date(posted + 9 * 3600_000 - 30 * 86400_000).toISOString().slice(0, 10) : undefined;
+      const drafts = since ? this.store.forPresenter(meetingId, message.authorId)
+        .filter(draft => draft.eventDate >= since)
+        .sort((a, b) => b.eventDate.localeCompare(a.eventDate))
+        .slice(0, 5) : [];
+      if (drafts.length > 0) {
+        // 利用者由来の題名も未信頼の選択肢データとして渡す。既存の本文や他の項目は含めない。
+        const applications = drafts.map(({ title, eventDate }) => ({ title: [...title].slice(0, MAX_TITLE_LENGTH).join(""), eventDate }));
+        question = { ...classification, criteria: {
+          ...classification.criteria,
+          follow_up: `${classification.criteria.follow_up}. The author already has applications for this meeting (event date and talk title): ${JSON.stringify(applications)}`,
+        } };
+      }
+    }
+    const category = await this.tryChoose(message.content, "classification", question);
     if (!category) return { status: "retry", reason: "judge_unavailable", source };
     const held = check(category, review);
     if (held) return held;
     if (category.answer === "unrelated") return { status: "unrelated", source };
-    const materials = extractMaterials(message.content, message.attachments);
     if (category.answer === "follow_up") return this.followUp(meetingId, message, source, review, materials);
     return this.application(meetingId, message, source, review, materials);
   }
@@ -116,17 +135,20 @@ export class PostExtractor {
       this.store.hasPendingFrom(meetingId, message.authorId, message.id)
         ? { status: "retry", reason: "awaiting_application", source } : held;
     if (drafts.length === 0) return waitOr(review("no_choice"));
-    if (drafts.length > MAX_CHOICES) return review("too_many_choices");
-    const criteria: Record<string, string> = Object.fromEntries(drafts.map(draft => [draft.id, draftLabel(draft)]));
-    criteria.none = "No matching draft";
-    const selected = await this.tryChoose(message.content, "draft", {
-      type: "choice", criteria,
-      instructions: `Select the existing draft (event date and talk title) this follow-up refers to, or none if uncertain.${UNTRUSTED}`,
-    });
-    if (!selected) return { status: "retry", reason: "judge_unavailable", source };
-    const held = check(selected, review);
-    if (held) return waitOr(held);
-    const draft = drafts.find(item => item.id === selected.answer)!;
+    let draft = matchingDraft(message, drafts);
+    if (!draft) {
+      if (drafts.length > MAX_CHOICES) return review("too_many_choices");
+      const criteria: Record<string, string> = Object.fromEntries(drafts.map(draft => [draft.id, draftLabel(draft)]));
+      criteria.none = "No matching draft";
+      const selected = await this.tryChoose(message.content, "draft", {
+        type: "choice", criteria,
+        instructions: `Select the existing draft (event date and talk title) this follow-up refers to, or none if uncertain.${UNTRUSTED}`,
+      });
+      if (!selected) return { status: "retry", reason: "judge_unavailable", source };
+      const held = check(selected, review);
+      if (held) return waitOr(held);
+      draft = drafts.find(item => item.id === selected.answer)!;
+    }
     // 日付のない資料の追記は可能。別日付への変更は自動で行わない。
     const undated = resolveEventDate(message.content, [], message.createdAt);
     if (undated.status !== "unresolved" || undated.reason !== "missing") {
@@ -176,6 +198,27 @@ function check(answer: ChoiceAnswer, review: Review): ExtractionResult | undefin
 /** 同じ発表者の下書きを区別できるよう、開催日と切り出し済みの題名を選択肢の説明にする。 */
 function draftLabel(draft: TalkDraft): string {
   return `${draft.eventDate} ${draft.title}`;
+}
+
+/** 日付か引用題名で 1 件に決まる時だけ採用する。異なる下書きを指す時も API に任せる。 */
+function matchingDraft(message: GatewayMessage, drafts: readonly TalkDraft[]): TalkDraft | undefined {
+  const text = message.content.replace(/https?:\/\/\S+/gi, "");
+  if (/(?:では|じゃ)(?:ありません|ない|なく|無い|無く|ございません)|違(?:います|う|って)/.test(text)) return undefined;
+  const titles = [...text.matchAll(/「([^「」『』]+)」|『([^「」『』]+)』/g)]
+    .map(match => (match[1] ?? match[2])!.trim());
+  // 空の引用・入れ子・閉じ忘れも、単独の題名として確定しない。
+  const quotationMarks = text.match(/[「」『』]/g) ?? [];
+  if (titles.length > 1 || quotationMarks.length !== titles.length * 2) return undefined;
+  const titleMatches = titles.length === 1 ? drafts.filter(draft => draft.title.trim() === titles[0]) : [];
+  if (titles.length === 1 && titleMatches.length !== 1) return undefined;
+  const titleMatch = titleMatches[0];
+  const date = resolveEventDate(text, drafts.map(draft => draft.eventDate), message.createdAt, { includePast: true });
+  if (date.status === "resolved") {
+    const dateMatches = drafts.filter(draft => draft.eventDate === date.date);
+    const dateMatch = dateMatches.length === 1 ? dateMatches[0] : undefined;
+    return dateMatch && (!titleMatch || titleMatch.id === dateMatch.id) ? dateMatch : undefined;
+  }
+  return titleMatch;
 }
 
 export const MAX_RETRY_ATTEMPTS = 8;
