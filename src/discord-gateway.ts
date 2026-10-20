@@ -1,4 +1,4 @@
-import { Client, ChannelType, Events, GatewayIntentBits, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
+import { Client, ChannelType, Events, GatewayIntentBits, MessageFlags, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
 import type { NotificationTarget } from "./hub-store";
 import type { HubView } from "./hub-setup";
 import { discordHubView, hubCommand, hubInteraction, validateHubChannels } from "./discord-hub";
@@ -15,6 +15,7 @@ export const clientOptions: ClientOptions = {
 };
 
 const GUILD_PAGE = 200;
+const NOTIFICATION_HISTORY_PAGES = 20;
 
 function toMessage(message: Message): GatewayMessage {
   return {
@@ -117,7 +118,7 @@ export class DiscordGateway implements Gateway {
   }
 
   async notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void> {
-    const payload = { ...discordHubView(view), nonce, enforceNonce: true };
+    const payload = { ...discordHubView(view), nonce, enforceNonce: true, flags: MessageFlags.SuppressEmbeds as const };
     if (target.type === "dm") {
       const user = await this.client.users.fetch(target.userId);
       await user.send(payload);
@@ -128,6 +129,41 @@ export class DiscordGateway implements Gateway {
       throw new Error("Notification channel must belong to configured guild");
     }
     await channel.send(payload);
+  }
+
+  /** SDK のキャッシュや短時間の nonce 重複排除に頼らず、自分の通知を照合する。 */
+  async findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string,
+    attemptedAt = 0): Promise<boolean | "unknown"> {
+    const channel = target.type === "dm"
+      ? await (await this.client.users.fetch(target.userId)).createDM()
+      : await this.client.channels.fetch(target.channelId);
+    if (!channel || (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
+      throw Object.assign(new Error("Invalid notification channel"), { status: 404 });
+    }
+    if (target.type === "dm" ? channel.type !== ChannelType.DM : channel.type === ChannelType.DM || channel.guildId !== guildId) {
+      throw new Error("Invalid notification channel");
+    }
+    if (channel.type !== ChannelType.DM) {
+      const me = channel.guild.members.me ?? await channel.guild.members.fetchMe();
+      if (!channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])) {
+        throw Object.assign(new Error("Notification channel lacks history permissions"), { status: 403 });
+      }
+    }
+    let before: string | undefined;
+    for (let page = 0; page < NOTIFICATION_HISTORY_PAGES; page++) {
+      const messages = [...(await channel.messages.fetch({ limit: 100, cache: false, ...(before ? { before } : {}) })).values()];
+      if (messages.some(message => message.author.id === this.client.user?.id
+        && (message.nonce === nonce || message.components.some(row => "components" in row
+          && row.components.some(component => "customId" in component && component.customId === buttonId))))) return true;
+      // 全履歴を読み切れた場合と、送信を試みた時刻より前まで遡れた場合は未送信とする。ページ数の上限は未送信の証拠にしない。
+      if (messages.length < 100) return false;
+      const oldest = messages.reduce((a, b) => BigInt(a.id) < BigInt(b.id) ? a : b);
+      // ホストと Discord の時計の差に 5 秒の余裕を持たせる。旧記録は時刻不明なのでページ数で制限する。
+      if (attemptedAt > 0 && oldest.createdTimestamp < attemptedAt - 5000) return false;
+      if (before && BigInt(oldest.id) >= BigInt(before)) return "unknown";
+      before = oldest.id;
+    }
+    return "unknown";
   }
 
   async validateChannels(guildId: string, channelIds: string[], purpose: "read" | "notify", userId: string): Promise<void> {

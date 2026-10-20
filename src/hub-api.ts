@@ -131,6 +131,11 @@ export class HubApi implements HubLookup {
     return new URL(`/event/detail/${id}/update/`, this.baseUrl).href;
   }
 
+  registrationUrl(communityId: number): string {
+    this.checkId(communityId);
+    return new URL(`/event/apply/${communityId}/`, this.baseUrl).href;
+  }
+
   async communities(discordId: string): Promise<HubCommunity[]> {
     if (!/^[0-9]{17,20}$/.test(discordId)) throw new Error("Invalid Discord ID");
     try {

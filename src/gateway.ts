@@ -45,6 +45,12 @@ export interface Gateway {
   fetchMessages(channelId: string, query: HistoryQuery): Promise<GatewayMessage[]>;
 }
 
+/** Discord がアクセス・宛先を明示的に拒否した応答だけを扱う。 */
+export function notificationTargetUnavailable(error: unknown): boolean {
+  return error !== null && typeof error === "object" && "status" in error
+    && (error.status === 403 || error.status === 404);
+}
+
 export function compareIds(a: string, b: string): number {
   const left = BigInt(a);
   const right = BigInt(b);

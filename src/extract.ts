@@ -53,7 +53,9 @@ export class PostExtractor {
     const review: Review = reason => ({ status: "review", reason, question: "これは応募ですか", source });
     let result: ExtractionResult;
     try {
-      result = await this.run(meetingId, message, source, review);
+      // 主催者が「無視する」で閉じた投稿は、受信箱に戻っても抽出・登録し直さない。
+      result = this.store.reviewClosed(message.id) ? { status: "unrelated", source }
+        : await this.run(meetingId, message, source, review);
     } catch {
       // DB 等の例外にも投稿本文・SQL・接続情報が含まれ得るので返さない。
       result = { status: "retry", reason: "store_unavailable", source };

@@ -67,11 +67,11 @@ export class HubStore extends MessageStore {
     }));
   }
 
-  messageSettings(channelId: string, messageId: string): HubSetting[] {
+  messageSettings(channelId: string, messageId: string, includePaused = false): HubSetting[] {
     const rows = this.db.query<{ guild_id: string; community_id: number; baseline: string }, [string]>(
       "SELECT guild_id, community_id, baseline FROM hub_channels WHERE channel_id = ?",
     ).all(channelId);
-    return this.settings().filter(s => !s.paused && rows.some(row => row.guild_id === s.guildId
+    return this.settings().filter(s => (includePaused || !s.paused) && rows.some(row => row.guild_id === s.guildId
       && row.community_id === s.community.id && compareIds(messageId, row.baseline) > 0));
   }
 
