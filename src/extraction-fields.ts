@@ -42,10 +42,10 @@ export function mergeMaterials(...groups: readonly Material[][]): Material[] {
 
 export const MAX_TITLE_LENGTH = 80;
 const QUOTED = /^(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』|"([^「」『』"“”]+)"|“([^「」『』"“”]+)”)$/;
-const INLINE_QUOTED = /^[^「」『』]*(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』)[^「」『』]*$/;
+const INLINE_QUOTED = /^[^「」『』"“”]*(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』)[^「」『』"“”]*$/;
 const LABELLED = /^(?:題名|タイトル|演題|title)(?:\s*[:：]\s*|\s+)(.+)$/i;
 // 行の途中のラベル。文中の引用を題名として採る前に、ラベル付きの題名と食い違わないか見る。
-const EMBEDDED_LABEL = /(?:題名|タイトル|演題|title)\s*[:：]/i;
+const EMBEDDED_LABEL = /(?:題名|タイトル|演題|title)(?:\s*[:：]|\s+[^\s「」『』"“”])/i;
 const PLAIN_FORBIDDEN = /[。．.!?！？、，,「」『』"“”]/;
 const UNSAFE = /https?:\/\/|<@|@everyone|@here/i;
 
