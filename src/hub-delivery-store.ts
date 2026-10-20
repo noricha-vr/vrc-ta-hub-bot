@@ -79,6 +79,7 @@ export class HubDeliveryStore {
     this.db.query(`INSERT INTO hub_deliveries (draft_id, guild_id, community_id) VALUES (?, ?, ?)
       ON CONFLICT (draft_id) DO UPDATE SET state = CASE
         WHEN hub_id IS NOT NULL THEN 'ready' WHEN attempted_hash <> '' THEN 'creating' ELSE 'queued' END,
+        guild_id = excluded.guild_id, community_id = excluded.community_id,
         attempts = 0, next_at = 0, reason = ''
       WHERE state = 'closed' AND reason = 'setting_removed'`)
       .run(draftId, guildId, communityId);
@@ -95,7 +96,8 @@ export class HubDeliveryStore {
     this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ? WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
   }
   requeue(id: string): void {
-    this.db.query("UPDATE hub_deliveries SET state = 'queued', attempted_hash = '' WHERE draft_id = ? AND state <> 'closed'").run(id);
+    this.db.query(`UPDATE hub_deliveries SET state = CASE WHEN state = 'closed' THEN 'closed' ELSE 'queued' END,
+      attempted_hash = '' WHERE draft_id = ?`).run(id);
   }
   created(id: string, hubId: number, hash: string): void {
     this.db.query(`UPDATE hub_deliveries SET state = 'ready', hub_id = ?, synced_hash = ?,

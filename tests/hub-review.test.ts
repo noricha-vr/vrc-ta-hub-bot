@@ -856,6 +856,28 @@ for (const delivered of [false, true]) test(`再設定後の新しい応募が�
   expect(f.notifications.at(-1)?.target).toEqual({ type: "dm", userId });
 });
 
+for (const delivered of [false, true]) test(`別サーバーの再設定後に統合された応募は今のサーバーと通知先へ配送する（作成済み: ${delivered}）`, async () => {
+  const f = fixture(); const draft = f.create();
+  f.setEventsDown(!delivered); await f.review.flush();
+  f.settings.leave("100", 1);
+  f.settings.configure({ guildId: "200", community, channelIds: ["20"], notification: { type: "channel", channelId: "21" } }, "200");
+  f.setEventsDown(false); f.advance(); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed" });
+  const before = f.calls.length;
+  const merged = f.extracted.create({ meetingId: draft.meetingId, presenterId: draft.presenterId, presenterName: draft.presenterName,
+    eventDate: draft.eventDate, title: draft.title, materials: draft.materials },
+    { messageId: "201", channelId: "20", url: "https://discord.com/channels/200/20/201" });
+  expect(merged.draft.id).toBe(draft.id);
+  f.reopen(); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42, guild_id: "200", community_id: 1 });
+  expect(f.createCount).toBe(1);
+  expect(f.calls.slice(before).some(c => c.method === (delivered ? "PATCH" : "POST"))).toBe(true);
+  expect(f.settings.drafts("100", 1)).toEqual([]);
+  expect(f.settings.drafts("200", 1)[0]).toMatchObject({ id: "42", guildId: "200", approved: false });
+  expect(f.notifications).toHaveLength(delivered ? 2 : 1);
+  expect(f.notifications.at(-1)).toMatchObject({ guildId: "200", target: { type: "channel", channelId: "21" } });
+});
+
 test("設定のない配送と判断の保留は健康状態の集計から除く", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   const other = f.create("223456789012345678", "102"); await f.review.flush();
@@ -928,6 +950,24 @@ for (const status of [201, 400]) test(`作成 POST 中の leave を後の ${stat
   expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed" });
   expect(f.settings.drafts("100", 1)).toEqual([]); expect(f.notifications).toEqual([]);
   expect(f.review.pendingReviews()).toEqual({ count: 0, oldestAgeSeconds: 0 });
+});
+
+for (const status of [400, 401, 403, 404, 422, 429]) test(`作成 POST 中の leave 後の ${status} 応答は未作成を記録し、再設定後の応募で新規作成する`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateStatus(status);
+  f.beforeCreate(() => { f.settings.leave("100", 1); });
+  await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed", attempted_hash: "", hub_id: null });
+  expect(f.savedCount).toBe(0); expect(f.notifications).toEqual([]);
+  f.reopen(); f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "dm", userId } }, "200");
+  f.setCreateStatus(201); f.beforeCreate(() => {});
+  await f.review.flush(); expect(f.createCount).toBe(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed", attempted_hash: "" });
+  expect(f.create(userId, "201").id).toBe(draft.id);
+  f.reopen(); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42 });
+  expect(f.createCount).toBe(2); expect(f.savedCount).toBe(1); expect(f.notifications).toHaveLength(1);
+  expect(f.notifications[0]?.target).toEqual({ type: "dm", userId });
+  expect(f.calls.some(c => c.path === "/api/v1/event-details/" && c.method === "GET")).toBe(false);
 });
 
 test("flush の配送一覧を読んだ後にボタンで閉じた下書きには PATCH と承認待ち通知を送らない", async () => {

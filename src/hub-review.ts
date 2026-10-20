@@ -53,7 +53,7 @@ export class HubReview {
       const previous = this.deliveries.get(draft.id);
       this.deliveries.enqueue(draft.id, setting.guildId, setting.community.id);
       if (previous?.state === "closed" && previous.reason === "setting_removed" && previous.hub_id) {
-        this.recordDraft(previous, draft, previous.hub_id, false);
+        this.recordDraft(this.deliveries.get(draft.id)!, draft, previous.hub_id, false);
       }
     }
   }
