@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { HubBot } from "./bot";
 import { ConfigConflictError, loadConfigFile } from "./config";
 import { DiscordGateway } from "./discord-gateway";
-import { acquireLock } from "./lock";
+import { acquireLock, LockExistsError } from "./lock";
 import { HubStore } from "./hub-store";
 import { HubApi } from "./hub-api";
 import { HubSetup } from "./hub-setup";
@@ -20,7 +20,9 @@ export const INBOX_MAX_AGE_SECONDS = 23 * 3600;
 export const INBOX_PURGE_INTERVAL_MS = 300_000;
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
-const log = (event: string, fields?: { keys: string[] }) => console.error(JSON.stringify({ time: new Date().toISOString(), event, ...fields }));
+// 端末やセッションを閉じた時の SIGHUP も正常停止にして、ロックを残さない。
+export const SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+const log = (event: string, fields?: { keys?: string[]; reason?: string; lockHolderAlive?: boolean | "unknown" }) => console.error(JSON.stringify({ time: new Date().toISOString(), event, ...fields }));
 
 /** mkdirSync の mode は既存のディレクトリに効かないので、起動ごとに権限をそろえる。 */
 export function restrictDataPermissions(dataDir: string, dbPath: string): void {
@@ -57,6 +59,9 @@ async function main(): Promise<void> {
   const onSignal = () => {
     void shutdown(false).then(() => process.exit(0), () => process.exit(1));
   };
+  // ロックを取ったらすぐ受ける（初期化中に止まってもロックを残さない）。
+  // 停止を待つ間に同じシグナルが再び来ても既定の終了にならないよう、once でなく on で受け続ける。
+  for (const signal of SHUTDOWN_SIGNALS) process.on(signal, onSignal);
   try {
     const dbPath = join(config.dataDir, "state.sqlite");
     store = new HubStore(dbPath);
@@ -84,13 +89,10 @@ async function main(): Promise<void> {
       log,
       onFatal: () => { void shutdown(true).finally(() => process.exit(1)); },
     });
-    process.once("SIGINT", onSignal);
-    process.once("SIGTERM", onSignal);
     await bot.start(config.discordToken);
   } catch {
     await shutdown(true);
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
+    for (const signal of SHUTDOWN_SIGNALS) process.off(signal, onSignal);
     throw new Error("Bot initialization failed");
   }
 }
@@ -99,7 +101,8 @@ if (import.meta.main) {
   main().catch(error => {
     // Never log raw SDK errors, tokens, request URLs, or message contents.
     if (error instanceof ConfigConflictError) log("bot_config_conflict", { keys: error.keys });
-    log("bot_start_failed");
+    if (error instanceof LockExistsError) log("bot_start_failed", { reason: "lock_exists", lockHolderAlive: error.holderAlive });
+    else log("bot_start_failed");
     process.exit(1);
   });
 }
