@@ -304,20 +304,33 @@ test("日付は日本時間・年越し・次回・明示年を考慮し、URL �
   expect(resolveEventDate("2/30", ["2027-02-30"], createdAt)).toEqual({ status: "unresolved", reason: "unmatched" });
 });
 
-test("1 行の投稿で引用が行の途中にある時は題名にせず、本文の残りを保存しない", async () => {
+test("1 行の投稿で引用が行の途中にある時は題名だけを採り、本文の残りを保存しない", async () => {
   const f = fixture();
   const marker = "PRIVATE-NOTE-7c1d";
   const item = post("100", `10/23 に応募します。題名は「型の話」です。${marker} の件は後で連絡します`);
   f.judge.answer("application"); f.judge.answer("line_1");
   const result = await f.extractor.extract("meeting-1", item);
-  expect(result).toMatchObject({ status: "review", reason: "title_unextracted" });
+  expect(result).toMatchObject({ status: "candidate", draft: { title: "型の話" } });
   expect(JSON.stringify(result)).not.toContain(marker);
-  expect(f.store.counts().drafts).toBe(0);
+  expect(JSON.stringify(f.store.forMessage(item.id))).not.toContain(marker);
+  expect(f.store.counts().drafts).toBe(1);
+});
+
+test("ラベル直後の引用を含む 1 行の応募から題名を切り出す", async () => {
+  const f = fixture(async () => ["2026-10-22"]);
+  const item = post("100", "10/22（木）のLTに応募します！ タイトル「Bun で Discord ボットを作ってみた話」、発表者は○○です。10分くらいでお願いします。");
+  f.inbox.save(item);
+  f.judge.answer("application"); f.judge.answer("line_1");
+  expect(await processInboxMessage(f.extractor, f.inbox, "meeting-1", item)).toMatchObject({
+    status: "candidate", draft: { title: "Bun で Discord ボットを作ってみた話", eventDate: "2026-10-22" },
+  });
+  expect(f.inbox.messages("10")).toEqual([]);
 });
 
 for (const [content, label] of [
   ["10/23 に応募します。型の話をします。私的な連絡もここに書きます", "切り出せない 1 行"],
   [`10/23 に応募\n題名: ${"長".repeat(81)}`, "80 字超の題名"],
+  ["10/23 に応募します。タイトル「型の話」、補足は「Bun の話」です", "引用が 2 組ある 1 行"],
 ] as const) {
   test(`${label}は下書きにせず確認対象にする`, async () => {
     const f = fixture(); const item = post("100", content); f.inbox.save(item);
@@ -328,10 +341,22 @@ for (const [content, label] of [
 }
 
 test("題名の切り出し規則", () => {
-  for (const [line, title] of [["題名: 型の話", "型の話"], ["タイトル：『型と私』", "型と私"], ["発表「A」をします", undefined],
+  for (const [line, title] of [["題名: 型の話", "型の話"], ["タイトル：『型と私』", "型と私"], ["発表「A」をします", "A"],
     ["Title: \"Types\"", "Types"], ["演題: 型の話 https://example.invalid/x", undefined], ["題名: <@123>", undefined],
     ["型の話", undefined], ["題名:", undefined], [`「${"a".repeat(80)}」`, "a".repeat(80)], [`「${"a".repeat(81)}」`, undefined]] as const) {
     expect(extractTitle(line)).toBe(title);
+  }
+});
+
+test("文中の引用は 1 組だけ切り出し、曖昧な引用や不正な題名は採らない", () => {
+  for (const line of ["10/23 に「型の話」で応募します", "タイトル「型の話」", "発表『 型の話 』をします", "タイトル『型の話』"]) {
+    expect(extractTitle(line)).toBe("型の話");
+  }
+  expect(extractTitle(`発表「${"a".repeat(80)}」をします`)).toBe("a".repeat(80));
+  for (const line of ["「A」と「B」", "『A』と『B』", "「A」と『B』", "タイトル「A」と「B」", "発表「A『B』」をします",
+    "発表「A』をします", "発表「A」をします「", "発表「」をします", "発表『  』をします", `発表『${"a".repeat(81)}』をします`,
+    "発表「https://example.invalid/x」をします", "発表『<@123>』をします", "発表「@everyone」をします", "発表『@here』をします"]) {
+    expect(extractTitle(line)).toBeUndefined();
   }
 });
 
@@ -470,12 +495,11 @@ test("応募の再試行中に届いた続報は保留し、応募の後に処�
 
 test("ラベルの後に別の文が続く題名は採らず、ラベルと題名だけの行は採る", async () => {
   expect(extractTitle("題名: 型の話。PRIVATE-NOTE の件は後で連絡します")).toBeUndefined();
-  expect(extractTitle("題名: 型の話。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
+  expect(extractTitle("題名: 「型の話」。後で「PRIVATE-NOTE」について連絡します")).toBeUndefined();
   expect(extractTitle("題名: 型の話、あと懇親会は欠席です")).toBeUndefined();
   expect(extractTitle("Title: Types, see you")).toBeUndefined();
   expect(extractTitle("Title: Types. PRIVATE-NOTE please contact me later")).toBeUndefined();
   expect(extractTitle("I will talk. Title: Types")).toBeUndefined();
-  expect(extractTitle("10/23 に「型の話」で応募します")).toBeUndefined();
   for (const line of ["題名：「型の話」", "「型の話」", " 『型の話』。 ", "題名 型の話", "演題: \"型の話\""]) expect(extractTitle(line)).toBe("型の話");
   expect(extractTitle("題名: 型の話")).toBe("型の話");
   expect(extractTitle("題名: 型の話。")).toBe("型の話");
