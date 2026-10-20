@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { INBOX_MAX_AGE_SECONDS, INBOX_PURGE_INTERVAL_MS, restrictDataPermissions } from "../src/main";
+import { INBOX_MAX_AGE_SECONDS, INBOX_PURGE_INTERVAL_MS, SHUTDOWN_SIGNALS, restrictDataPermissions } from "../src/main";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -59,6 +59,34 @@ test("設定ファイルが読めない時も値やファイルパスをログ�
   expect(result.stdout.toString()).toBe("");
   const logs = result.stderr.toString().trim().split("\n").map(line => JSON.parse(line));
   expect(logs.map(({ time, ...entry }) => entry)).toEqual([{ event: "bot_start_failed" }]);
+});
+
+test("端末を閉じた時の SIGHUP も正常停止としてロックを解放し、停止中の再受信でも既定の終了にしない", () => {
+  expect([...SHUTDOWN_SIGNALS]).toEqual(["SIGINT", "SIGTERM", "SIGHUP"]);
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  expect(source).toContain("process.on(signal, onSignal)");
+  expect(source).not.toContain("process.once(");
+});
+
+for (const [pid, alive] of [[process.pid, true], [2 ** 22 + 12345, false]] as const)
+test(`ロックで起動できない時は理由と持ち主の生死をログに出し、ロックを奪わない: ${alive}`, () => {
+  const root = mkdtempSync(join(tmpdir(), "main-lock-"));
+  dirs.push(root);
+  const envPath = join(root, "bot.env");
+  writeFileSync(envPath, "");
+  const dataDir = join(root, "data");
+  mkdirSync(dataDir);
+  const lock = join(dataDir, "bot.lock");
+  writeFileSync(lock, `${JSON.stringify({ pid })}\n`);
+  const result = Bun.spawnSync([process.execPath, "--no-env-file", new URL("../src/main.ts", import.meta.url).pathname], {
+    cwd: root, env: { BOT_ENV_FILE: envPath, BOT_DATA_DIR: dataDir, DISCORD_TOKEN: "token-secret",
+      HUB_API_KEY: "hub-secret", HUB_BASE_URL: "https://hub.invalid", JEV_API_KEY: "jev-secret" },
+  });
+  expect(result.exitCode).toBe(1);
+  const logs = result.stderr.toString().trim().split("\n").map(line => JSON.parse(line));
+  expect(logs.map(({ time, ...entry }) => entry)).toEqual([{ event: "bot_start_failed", reason: "lock_exists", lockHolderAlive: alive }]);
+  expect(result.stderr.toString()).not.toContain("secret");
+  expect(JSON.parse(readFileSync(lock, "utf8")).pid).toBe(pid);
 });
 
 test("start は .env.local の自動読み込みをせず BOT_ENV_FILE の不一致を検出する", () => {
