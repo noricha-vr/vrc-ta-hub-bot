@@ -13,8 +13,14 @@ export interface HubDelivery {
   attempts: number;
   next_at: number;
   reason: string;
-  decision: ReviewDecision | null;
-  discord_id: string | null;
+}
+
+export interface HubReviewDecision {
+  draft_id: string;
+  discord_id: string;
+  decision: ReviewDecision;
+  attempts: number;
+  next_at: number;
 }
 
 /** 送信前の記録と応答後の確定を分ける。本文や認証キーは保存しない。 */
@@ -34,7 +40,22 @@ export class HubDeliveryStore {
         next_at INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
         decision TEXT, discord_id TEXT
       );
+      CREATE TABLE IF NOT EXISTS hub_review_decisions (
+        draft_id TEXT NOT NULL, discord_id TEXT NOT NULL, decision TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (draft_id, discord_id)
+      );
     `);
+    // 旧形式の保留と再送時刻を、取り込み済みの行を上書きせずに移す。
+    this.db.transaction(() => {
+      this.db.exec(`
+        INSERT OR IGNORE INTO hub_review_decisions (draft_id, discord_id, decision, attempts, next_at)
+          SELECT draft_id, discord_id, decision, attempts, next_at FROM hub_deliveries
+          WHERE state <> 'closed' AND decision IS NOT NULL AND discord_id IS NOT NULL;
+        UPDATE hub_deliveries SET decision = NULL, discord_id = NULL, attempts = 0, next_at = 0, reason = ''
+          WHERE state <> 'closed' AND decision IS NOT NULL AND discord_id IS NOT NULL;
+      `);
+    })();
   }
   enqueue(draftId: string, guildId: string, communityId: number): void {
     this.db.query("INSERT OR IGNORE INTO hub_deliveries (draft_id, guild_id, community_id) VALUES (?, ?, ?)")
@@ -71,22 +92,49 @@ export class HubDeliveryStore {
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string): void {
-    this.db.query("UPDATE hub_deliveries SET decision = ?, discord_id = ?, next_at = 0 WHERE draft_id = ? AND decision IS NULL")
-      .run(decision, discordId, id);
+    this.db.query(`INSERT INTO hub_review_decisions (draft_id, discord_id, decision) VALUES (?, ?, ?)
+      ON CONFLICT (draft_id, discord_id) DO UPDATE SET decision = excluded.decision`).run(id, discordId, decision);
   }
-  clearDecision(id: string): void {
-    this.db.query("UPDATE hub_deliveries SET decision = NULL, discord_id = NULL, next_at = 0 WHERE draft_id = ?").run(id);
+  decision(id: string, discordId: string): HubReviewDecision | undefined {
+    return this.db.query<HubReviewDecision, [string, string]>(
+      "SELECT * FROM hub_review_decisions WHERE draft_id = ? AND discord_id = ?",
+    ).get(id, discordId) ?? undefined;
+  }
+  decisions(id: string): HubReviewDecision[] {
+    return this.db.query<HubReviewDecision, [string]>(
+      "SELECT * FROM hub_review_decisions WHERE draft_id = ? ORDER BY rowid",
+    ).all(id);
+  }
+  dueDecisions(now: number): HubReviewDecision[] {
+    return this.db.query<HubReviewDecision, [number]>(`SELECT r.* FROM hub_review_decisions r
+      JOIN hub_deliveries d ON d.draft_id = r.draft_id
+      WHERE d.state <> 'closed' AND r.next_at <= ? ORDER BY r.rowid`).all(now);
+  }
+  retryDecision(id: string, discordId: string, now: number): void {
+    const attempts = (this.decision(id, discordId)?.attempts ?? 0) + 1;
+    const delay = Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
+    this.db.query("UPDATE hub_review_decisions SET attempts = ?, next_at = ? WHERE draft_id = ? AND discord_id = ?")
+      .run(attempts, now + delay, id, discordId);
+  }
+  clearDecision(id: string, discordId: string): void {
+    this.db.query("DELETE FROM hub_review_decisions WHERE draft_id = ? AND discord_id = ?").run(id, discordId);
   }
   closed(id: string, reason: string): void {
-    this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, decision = NULL, discord_id = NULL WHERE draft_id = ?")
-      .run(reason, id);
+    this.db.transaction(() => {
+      this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, decision = NULL, discord_id = NULL WHERE draft_id = ?")
+        .run(reason, id);
+      this.db.query("DELETE FROM hub_review_decisions WHERE draft_id = ?").run(id);
+    })();
   }
   counts(): Record<string, number> {
     const counts: Record<string, number> = {};
     for (const row of this.db.query<{ state: string; n: number }, []>(
       "SELECT state, count(*) AS n FROM hub_deliveries GROUP BY state",
     ).all()) counts[row.state] = row.n;
-    counts.retry = this.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hub_deliveries WHERE reason <> '' AND state <> 'closed'").get()!.n;
+    counts.retry = this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM hub_deliveries d
+      WHERE state <> 'closed' AND (reason <> '' OR EXISTS (
+        SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
+      ))`).get()!.n;
     return counts;
   }
   close(): void { this.db.close(); }
