@@ -106,8 +106,8 @@ export class HubReview {
       let id: number;
       try { id = await this.hub.createDraft(fields, draft.sources[0]!.url); }
       catch (error) {
-        // 明確な拒否は再送できる。応答なしの時だけ creating を残して照合する。
-        if (error instanceof HubApiError && error.status > 0) this.deliveries.requeue(row.draft_id);
+        // 処理前の拒否だけ再送する。保存された可能性があれば creating を残して照合する。
+        if (error instanceof HubApiError && [400, 401, 403, 404, 422, 429].includes(error.status)) this.deliveries.requeue(row.draft_id);
         throw error;
       }
       this.deliveries.created(row.draft_id, id, hash);
@@ -145,19 +145,21 @@ export class HubReview {
       sourceUrl: draft.sources[0]!.url, createdAt: new Date(this.now() * 1000).toISOString(), approved });
   }
 
-  private async submitDecision(row: HubDelivery): Promise<"done" | "forbidden" | "processed"> {
+  private async submitDecision(row: HubDelivery, preservePending = false): Promise<"done" | "forbidden" | "processed"> {
     try { await this.hub.reviewDraft(row.hub_id!, row.decision!, row.discord_id!); }
     catch (error) {
       if (error instanceof HubApiError && error.status === 403) {
-        this.deliveries.clearDecision(row.draft_id);
+        if (!preservePending) this.deliveries.clearDecision(row.draft_id);
         this.log("hub_review_forbidden"); return "forbidden";
       }
       if (error instanceof HubApiError && error.status === 409) {
-        const draft = this.extracted.get(row.draft_id)!;
-        const found = await this.hub.findDraft(draft.sources[0]!.url);
-        if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
-        this.recordDraft(row, draft, found.id, found.status === "approved");
-        this.deliveries.closed(row.draft_id, found.status);
+        if (!preservePending) {
+          const draft = this.extracted.get(row.draft_id)!;
+          const found = await this.hub.findDraft(draft.sources[0]!.url);
+          if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
+          this.recordDraft(row, draft, found.id, found.status === "approved");
+          this.deliveries.closed(row.draft_id, found.status);
+        }
         this.log("hub_review_already_processed"); return "processed";
       }
       throw error;
@@ -179,16 +181,23 @@ export class HubReview {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
       if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
-      // 権限が未確認の保留は、別の利用者の操作を妨げない。
+      // 別の利用者は直接送信し、成功するまで元の保留を残す。
       if (this.busy.has(row.draft_id) || (row.decision && row.discord_id === i.userId)) {
         await i.edit(text("この発表は処理中です。しばらく待ってから確認してください。")); return;
       }
       this.busy.add(row.draft_id); locked = row.draft_id;
-      this.deliveries.queueDecision(row.draft_id, match![2] as "approved" | "rejected", i.userId);
+      const decision = match![2] as "approved" | "rejected";
+      const preservePending = row.decision !== null;
+      if (!preservePending) this.deliveries.queueDecision(row.draft_id, decision, i.userId);
       let outcome: "done" | "forbidden" | "processed";
       try {
-        outcome = await this.submitDecision(this.deliveries.get(row.draft_id)!);
+        outcome = await this.submitDecision({ ...row, decision, discord_id: i.userId }, preservePending);
       } catch {
+        if (preservePending) {
+          this.log("hub_review_failed");
+          await i.edit(text("ハブに接続できません。しばらく待ってから確認してください。"));
+          return;
+        }
         this.deliveries.retry(row.draft_id, this.now(), "hub_review_retry");
         this.log("hub_review_retry");
         await i.edit(text("ハブに接続できません。操作を保存しました。復旧後に同じ操作を再送します。"));

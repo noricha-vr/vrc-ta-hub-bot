@@ -71,7 +71,7 @@ export class HubDeliveryStore {
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string): void {
-    this.db.query("UPDATE hub_deliveries SET decision = ?, discord_id = ?, next_at = 0 WHERE draft_id = ?")
+    this.db.query("UPDATE hub_deliveries SET decision = ?, discord_id = ?, next_at = 0 WHERE draft_id = ? AND decision IS NULL")
       .run(decision, discordId, id);
   }
   clearDecision(id: string): void {

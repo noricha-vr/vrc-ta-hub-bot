@@ -48,14 +48,14 @@ export class HubApi implements HubLookup {
     validateHubBaseUrl(baseUrl);
   }
 
-  private async json(path: string | URL, method = "GET", body?: unknown): Promise<unknown> {
+  private async json(path: string | URL, method = "GET", body?: unknown, expectedStatus?: number): Promise<unknown> {
     try {
       const response = await this.request(new URL(path, this.baseUrl), {
         method, headers: { "X-API-Key": this.apiKey, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
         redirect: "error", signal: AbortSignal.timeout(15000),
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-      if (!response.ok) throw new HubApiError(response.status);
+      if (!response.ok || (expectedStatus !== undefined && response.status !== expectedStatus)) throw new HubApiError(response.status);
       return response.status === 204 ? undefined : await response.json();
     } catch (error) { throw error instanceof HubApiError ? error : new HubApiError(); }
   }
@@ -122,7 +122,7 @@ export class HubApi implements HubLookup {
   async reviewDraft(id: number, decision: ReviewDecision, discordId: string): Promise<void> {
     this.checkId(id);
     if (!["approved", "rejected"].includes(decision) || !/^[0-9]{1,20}$/.test(discordId)) throw new HubApiError();
-    await this.json(`/api/v1/event-details/${id}/review/`, "POST", { decision, discord_id: discordId });
+    await this.json(`/api/v1/event-details/${id}/review/`, "POST", { decision, discord_id: discordId }, 200);
   }
 
   private checkId(id: number): void { if (!Number.isSafeInteger(id) || id <= 0) throw new HubApiError(); }

@@ -33,7 +33,7 @@ function fixture() {
   let patchDown = false;
   let notifyDown = false;
   let lookupDown = false;
-  let createFailure: "none" | "lost" | "unconfirmed" = "none";
+  let createFailure: "none" | "lost" | "unconfirmed" | "saved" | "unreadable" = "none";
   let createStatus = 201;
   let reviewStatus = 200;
   let reviewFailure: "none" | "lost" | "timeout" = "none";
@@ -42,6 +42,7 @@ function fixture() {
   let beforePatch: (() => void) | undefined;
   let found: Array<Record<string, unknown>> = [];
   let createCount = 0;
+  let savedCount = 0;
   const request: HubRequest = async (url, options) => {
     expect(options.headers).toMatchObject({ "X-API-Key": "synthetic-key" });
     expect(url.origin).toBe("https://example.invalid");
@@ -58,13 +59,14 @@ function fixture() {
     if (url.pathname === "/api/v1/event-details/" && options.method === "POST") {
       beforeCreate?.();
       createCount++;
-      if (createFailure === "lost") {
-        found = [{ id: 42, source_url: body.source_url, source: "discord_bot", status: "pending" }];
-        throw new Error("synthetic lost response");
-      }
       if (createFailure === "unconfirmed") throw new Error("synthetic connection lost before response");
-      if (createStatus !== 201) return new Response("unavailable", { status: createStatus });
-      return Response.json({ id: 42 });
+      if (createFailure === "none" && createStatus !== 201) return new Response("unavailable", { status: createStatus });
+      const id = 42 + savedCount++;
+      found.push({ id, source_url: body.source_url, source: "discord_bot", status: "pending" });
+      if (createFailure === "lost") throw new Error("synthetic lost response");
+      if (createFailure === "saved") return new Response("unavailable", { status: createStatus });
+      if (createFailure === "unreadable") return new Response("invalid json", { status: 201 });
+      return Response.json({ id }, { status: 201 });
     }
     if (url.pathname === "/api/v1/event-details/42/" && options.method === "PATCH") {
       beforePatch?.();
@@ -72,7 +74,7 @@ function fixture() {
     }
     if (url.pathname === "/api/v1/event-details/42/review/") {
       if (reviewFailure === "timeout") throw new Error("synthetic timeout");
-      if (reviewStatus !== 200) return new Response("private", { status: reviewStatus });
+      if (reviewStatus !== 200) return new Response(reviewStatus === 204 ? null : "{}", { status: reviewStatus });
       if (reviewUserId && body.discord_id !== reviewUserId) return new Response("forbidden", { status: 403 });
       const status = body.decision;
       found = [{ id: 42, source_url: source.url, source: "discord_bot", status }];
@@ -97,6 +99,7 @@ function fixture() {
   return {
     get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp,
     get review() { return review; }, get deliveries() { return deliveries; }, get createCount() { return createCount; },
+    get savedCount() { return savedCount; },
     advance: (seconds = 30000) => { now += seconds; },
     reopen: () => {
       deliveries.close(); extracted.close(); settings.close();
@@ -163,7 +166,7 @@ test("ハブ停止中は送信待ちを保持し、再起動後の復旧で取�
   expect(f.deliveries.counts()).toMatchObject({ ready: 1, retry: 0 });
 });
 
-for (const status of [400, 403, 404, 409, 429, 500, 503]) test(`作成 POST の ${status} 応答は成否不明にせずバックオフ後に再送する`, async () => {
+for (const status of [400, 401, 403, 404, 422, 429]) test(`作成 POST の ${status} 応答は成否不明にせずバックオフ後に再送する`, async () => {
   const f = fixture(); const draft = f.create(); f.setCreateStatus(status);
   await f.review.flush();
   expect(f.deliveries.get(draft.id)).toMatchObject({ state: "queued", attempts: 1, next_at: 1300 });
@@ -172,10 +175,30 @@ for (const status of [400, 403, 404, 409, 429, 500, 503]) test(`作成 POST の 
   expect(f.deliveries.get(draft.id)).toMatchObject({ state: "queued", attempts: 2, next_at: 1900 });
   f.reopen(); f.setCreateStatus(201); f.advance(599); await f.review.flush(); expect(f.createCount).toBe(2);
   f.advance(1); await f.review.flush();
-  expect(f.createCount).toBe(3); expect(f.notifications).toHaveLength(1);
+  expect(f.createCount).toBe(3); expect(f.savedCount).toBe(1); expect(f.notifications).toHaveLength(1);
   expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", attempts: 0 });
   expect(f.extracted.pending(source.messageId)).toBeUndefined();
   expect(f.calls.some(c => c.path === "/api/v1/event-details/" && c.method === "GET")).toBe(false);
+});
+
+for (const status of [408, 409, 500, 502, 503, 504]) test(`保存後の ${status} 応答は再作成せず出典の照合で下書き 1 件に確定する`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateFailure("saved"); f.setCreateStatus(status);
+  await f.review.flush();
+  expect(f.savedCount).toBe(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "creating", attempts: 1 });
+  f.reopen(); f.advance(); f.setCreateFailure("none"); f.setCreateStatus(201); await f.review.flush();
+  expect(f.createCount).toBe(1); expect(f.savedCount).toBe(1); expect(f.notifications).toHaveLength(1);
+  expect(f.calls.filter(c => c.path === "/api/v1/event-details/" && c.method === "GET")).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42, attempts: 0 });
+});
+
+test("作成の 2xx 応答本文を読めない時も再作成せず照合する", async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateFailure("unreadable"); await f.review.flush();
+  expect(f.deliveries.get(draft.id)?.state).toBe("creating");
+  f.reopen(); f.advance(); f.setCreateFailure("none"); await f.review.flush();
+  expect(f.createCount).toBe(1); expect(f.savedCount).toBe(1);
+  expect(f.calls.filter(c => c.path === "/api/v1/event-details/" && c.method === "GET")).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42 });
 });
 
 test("作成応答消失後は出典を照合し、POST を重ねず同じ下書きへ復帰する", async () => {
@@ -249,6 +272,34 @@ test("レビューの障害時も押した人と判断を永続化し、復旧�
   f.reopen(); f.setReviewStatus(200); f.advance(); await f.review.flush();
   expect(f.deliveries.get(draft.id)?.state).toBe("closed");
   expect(f.calls.filter(c => c.path.endsWith("/review/")).every(c => c.body?.discord_id === userId)).toBe(true);
+});
+
+for (const failure of [201, 202, 204, 403, 409, 503, "timeout"] as const) test(`主催者の保留後に非主催者が押して ${failure} でも元の判断を保持し復旧後に送る`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const ownerId = "223456789012345678"; f.setReviewUser(ownerId); f.setReviewStatus(503);
+  await f.review.handle(interaction(draft.id, "approved", "100", ownerId).i);
+  const pending = f.deliveries.get(draft.id)!;
+  expect(pending).toMatchObject({ state: "ready", decision: "approved", discord_id: ownerId, next_at: 1300 });
+  f.reopen();
+  if (failure === "timeout") { f.setReviewStatus(200); f.setReviewFailure("timeout"); }
+  else f.setReviewStatus(failure);
+  if (failure === 409) f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
+  const before = f.calls.length;
+  const other = interaction(draft.id, "rejected"); await f.review.handle(other.i);
+  expect(f.calls.slice(before)).toEqual([
+    { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision: "rejected", discord_id: userId } },
+  ]);
+  expect(other.views[0]!.content).toContain(failure === 403 ? "主催者ではありません" : failure === 409 ? "処理済み" : "ハブに接続できません");
+  expect(other.views[0]!.content).not.toContain("操作を保存");
+  expect(f.deliveries.get(draft.id)).toEqual(pending);
+  f.reopen(); f.setReviewStatus(200); f.setReviewFailure("none");
+  f.advance(299); await f.review.flush(); expect(f.calls).toHaveLength(before + 1);
+  f.advance(1); await f.review.flush();
+  expect(f.calls.at(-1)).toEqual(
+    { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision: "approved", discord_id: ownerId } },
+  );
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved", decision: null, discord_id: null });
+  expect(f.settings.drafts("100", 1)[0]?.approved).toBe(true);
 });
 
 for (const failure of ["503", "timeout"] as const) test(`非主催者の ${failure} 後の保留が再起動後も主催者の操作を塞がない`, async () => {
