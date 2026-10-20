@@ -155,11 +155,11 @@ export class DiscordGateway implements Gateway {
       if (messages.some(message => message.author.id === this.client.user?.id
         && (message.nonce === nonce || message.components.some(row => "components" in row
           && row.components.some(component => "customId" in component && component.customId === buttonId))))) return true;
-      // 全履歴を読み切れた場合だけ未送信とする。時間・ページ数の上限は未送信の証拠にしない。
+      // 全履歴を読み切れた場合と、送信を試みた時刻より前まで遡れた場合は未送信とする。ページ数の上限は未送信の証拠にしない。
       if (messages.length < 100) return false;
       const oldest = messages.reduce((a, b) => BigInt(a.id) < BigInt(b.id) ? a : b);
       // ホストと Discord の時計の差に 5 秒の余裕を持たせる。旧記録は時刻不明なのでページ数で制限する。
-      if (attemptedAt > 0 && oldest.createdTimestamp < attemptedAt - 5000) return "unknown";
+      if (attemptedAt > 0 && oldest.createdTimestamp < attemptedAt - 5000) return false;
       if (before && BigInt(oldest.id) >= BigInt(before)) return "unknown";
       before = oldest.id;
     }

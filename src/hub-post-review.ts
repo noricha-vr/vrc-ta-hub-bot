@@ -104,7 +104,7 @@ export class HubPostReview {
         const view: HubView = {
           content: `${post.source.url}\n理由：${reasons[post.reason] ?? "自動で処理できないため確認が必要です。"}`,
           controls: [{ type: "buttons", buttons: [
-            { url: this.hub.registrationUrl(setting.community.id), label: "Hubで登録する" },
+            { url: this.hub.registrationUrl(setting.community.id), label: "Hub で登録する" },
             { id: buttonId, label: "無視する" },
           ] }],
         };

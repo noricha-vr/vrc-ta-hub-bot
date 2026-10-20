@@ -97,7 +97,7 @@ test(`確認待ちを ${target.type} へ一度だけ通知し、再起動後も�
   const payload = discordHubView(f.notices[0]!.view);
   expect(payload.allowedMentions).toEqual({ parse: [], repliedUser: false });
   expect(payload.components[0]!.toJSON().components).toMatchObject([
-    { label: "Hubで登録する", style: 5, url: "https://example.invalid/event/apply/1/" },
+    { label: "Hub で登録する", style: 5, url: "https://example.invalid/event/apply/1/" },
     { label: "無視する", custom_id: "hub-review:101:ignore" },
   ]);
   f.reopen(); await f.review.flush(); expect(f.notices).toHaveLength(2);
@@ -426,15 +426,15 @@ test(`成否不明の旧宛先の履歴が ${status} なら、今の設定の別
   expect(f.logs.join()).not.toContain("private response");
 });
 
-test("送信試行の時刻まで遡ったら再送を保留し、さらに古いページは取得しない", async () => {
+test("送信試行の時刻より前まで遡って見つからなければ未送信として送り、さらに古いページは取得しない", async () => {
   const f = fixture(); f.hold(); f.failNotify(true);
   await f.review.flush(); f.reopen(); f.failNotify(false);
   const attemptedAt = f.extracted.reviewNotification("101")!.attempted_at;
   const queries = notificationHistory(f, undefined, attemptedAt - 6000);
   await f.review.flush();
-  expect(f.notices).toHaveLength(0);
+  expect(f.notices).toHaveLength(1);
   expect(queries).toHaveLength(1);
-  expect(f.logs).toContain("hub_post_review_notification_unknown");
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, sending: 0 });
 });
 
 for (const status of [403, 404])
