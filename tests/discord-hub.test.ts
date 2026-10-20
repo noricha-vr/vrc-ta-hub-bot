@@ -192,11 +192,13 @@ test("edit button opens the hub URL and notification transports suppress all men
   expect(payload.components[0]!.toJSON().components[1]).toMatchObject({ style: 5, url: "https://example.invalid/event/detail/42/update/" });
   let guildId = "100";
   client.channels.fetch = (async () => ({ type: ChannelType.GuildText, get guildId() { return guildId; },
-    send: async (message: unknown) => { sent.push(message); } })) as unknown as typeof client.channels.fetch;
-  client.users.fetch = (async (id: string) => { users.push(id); return { send: async (message: unknown) => { sent.push(message); } }; }) as unknown as typeof client.users.fetch;
+    send: async (message: unknown) => { sent.push(message); return { channelId: "11", id: "501" }; } })) as unknown as typeof client.channels.fetch;
+  client.users.fetch = (async (id: string) => { users.push(id); return { send: async (message: unknown) => { sent.push(message); return { channelId: "900", id: "502" }; } }; }) as unknown as typeof client.users.fetch;
   try {
-    await gateway.notify("100", { type: "channel", channelId: "11" }, view, "nonce-1");
-    await gateway.notify("100", { type: "dm", userId: "123456789012345678" }, view, "nonce-2");
+    expect(await gateway.notify("100", { type: "channel", channelId: "11" }, view, "nonce-1"))
+      .toEqual({ channelId: "11", messageId: "501" });
+    expect(await gateway.notify("100", { type: "dm", userId: "123456789012345678" }, view, "nonce-2"))
+      .toEqual({ channelId: "900", messageId: "502" });
     expect(users).toEqual(["123456789012345678"]);
     expect(sent).toHaveLength(2);
     for (const message of sent) expect(message).toMatchObject({ allowedMentions: { parse: [], repliedUser: false }, enforceNonce: true,
@@ -257,4 +259,58 @@ test(`${target.type} の直近履歴から自分の nonce または通知ボタ�
     }
     historyDown = true; await expect(find()).rejects.toThrow("Synthetic history failure");
   } finally { await gateway.stop(); }
+});
+
+for (const channelType of [ChannelType.GuildText, ChannelType.DM])
+for (const result of ["承認済み（運営 ＠everyone）", "却下（運営）", "承認済み", "却下"])
+test(`元の通知を編集してリンクだけ残し結果を一行表示する: ${channelType} ${result}`, async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  const original = "承認待ちの発表があります。\n日付：2026-11-03(火)\n発表者：発表者\nテーマ：題名\nhttps://discord.com/channels/100/10/101";
+  let content = original;
+  let components = discordHubView({ content, controls: [{ type: "buttons", buttons: [
+    { id: "hub-review:draft:approved", label: "承認" },
+    { url: "https://example.invalid/edit/42", label: "直す" },
+    { id: "hub-review:draft:rejected", label: "却下" },
+  ] }] }).components;
+  const edits: Record<string, unknown>[] = [];
+  client.channels.fetch = (async (id: string) => {
+    expect(id).toBe("11");
+    return { type: channelType, messages: { fetch: async (options: { message: string; cache: boolean }) => {
+      expect(options).toEqual({ message: "501", cache: false });
+      const received = components.map(row => ({ components: row.toJSON().components.map(c => ({ ...c, toJSON: () => c })) }));
+      return { author: { id: "20" }, content, components: received, edit: async (payload: Record<string, unknown>) => {
+        edits.push(payload); content = payload.content as string; components = payload.components as typeof components;
+      } };
+    } } };
+  }) as unknown as typeof client.channels.fetch;
+  try {
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, result);
+    // 応答を失って再試行しても結果行を重複させない。
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, result);
+    expect(content).toBe(`${original}\n${result}`);
+    for (const edit of edits) {
+      expect(edit.allowedMentions).toEqual({ parse: [], repliedUser: false });
+      const rows = edit.components as typeof components;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.toJSON().components).toEqual([
+        expect.objectContaining({ style: 5, url: "https://example.invalid/edit/42", label: "直す" }),
+      ]);
+    }
+  } finally { await gateway.stop(); }
+});
+
+for (const member of [{ displayName: "サーバー表示名" }, { nick: "ニックネーム" }, null])
+test(`通知操作に Discord の表示名と元のメッセージ ID を渡す: ${JSON.stringify(member)}`, () => {
+  const raw = {
+    guildId: member ? "100" : null, channelId: "11", message: { id: "501" }, member,
+    user: { id: "123456789012345678", displayName: "アカウント表示名", username: "account" },
+    customId: "hub-review:00000000-0000-0000-0000-000000000000:approved",
+    isChatInputCommand: () => false, isStringSelectMenu: () => false, isChannelSelectMenu: () => false, isButton: () => true,
+  };
+  expect(hubInteraction(raw as unknown as Interaction)).toMatchObject({
+    userDisplayName: member && "displayName" in member ? member.displayName : member?.nick ?? "アカウント表示名",
+    notification: { channelId: "11", messageId: "501" },
+  });
 });

@@ -6,9 +6,11 @@ import type { ExtractionStore, PostReference, TalkDraft } from "./extraction-sto
 import type { HubSetting, HubStore, NotificationTarget } from "./hub-store";
 import type { HubInteraction, HubView } from "./hub-setup";
 import type { HubPostReview } from "./hub-post-review";
+import type { NotificationReference } from "./gateway";
 
 export interface HubReviewGateway {
-  notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void>;
+  notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<NotificationReference>;
+  editNotification(reference: NotificationReference, result: string): Promise<void>;
 }
 const text = (content: string): HubView => ({ content, controls: [] });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -119,7 +121,30 @@ export class HubReview {
         this.log("hub_review_retry");
       } finally { unlock(); }
     }
+    for (const pending of this.deliveries.dueNotifications(this.now())) {
+      if (this.busy.has(pending.draft_id)) continue;
+      const unlock = await this.lock(pending.draft_id);
+      try { await this.updateNotifications(pending.draft_id); }
+      finally { unlock(); }
+    }
     await this.posts?.flush();
+  }
+
+  private async updateNotifications(id: string): Promise<void> {
+    const row = this.deliveries.get(id);
+    if (!row || !this.setting(row)) return;
+    const name = discordText(row.reviewer_display_name);
+    const result = `${row.reason === "approved" ? "承認済み" : "却下"}${name ? `（${name}）` : ""}`;
+    for (const pending of this.deliveries.dueNotifications(this.now(), id)) {
+      try {
+        await this.gateway.editNotification({ channelId: pending.channel_id, messageId: pending.message_id }, result);
+        this.deliveries.notificationEdited(pending);
+        this.log("hub_review_notification_edited");
+      } catch {
+        this.deliveries.retryNotification(pending, this.now());
+        this.log("hub_review_notification_retry");
+      }
+    }
   }
 
   private fields(draft: TalkDraft, event: number): HubDetailFields {
@@ -197,8 +222,8 @@ export class HubReview {
           { id: `hub-review:${row.draft_id}:rejected`, label: "却下" },
         ] }],
       };
-      await this.gateway.notify(setting.guildId, setting.notification, view, fingerprint([row.draft_id, notificationHash]).slice(0, 24));
-      this.deliveries.notified(row.draft_id, notificationHash);
+      const reference = await this.gateway.notify(setting.guildId, setting.notification, view, fingerprint([row.draft_id, notificationHash]).slice(0, 24));
+      this.deliveries.notified(row.draft_id, notificationHash, reference);
       this.log("hub_review_notified");
     }
   }
@@ -218,13 +243,14 @@ export class HubReview {
       sourceUrl: row.source_url || draft.sources[0]!.url, createdAt: new Date(this.now() * 1000).toISOString(), approved });
   }
 
-  private async finishDecision(row: HubDelivery, decision: "approved" | "rejected"): Promise<void> {
+  private async finishDecision(row: HubDelivery, decision: "approved" | "rejected", displayName = ""): Promise<void> {
     const current = this.deliveries.get(row.draft_id);
     if (!current || current.state === "closed" || !this.setting(current)) return;
     const draft = this.extracted.get(current.draft_id)!;
     // 判断は資料の更新より先に確定し、更新の失敗で再送待ちに戻さない。
     this.recordDraft(current, draft, current.hub_id!, decision === "approved");
-    this.deliveries.closed(current.draft_id, decision);
+    this.deliveries.closed(current.draft_id, decision, displayName);
+    await this.updateNotifications(current.draft_id);
     try { await this.syncClosed(current.draft_id); }
     catch {
       this.deliveries.retry(current.draft_id, this.now(), "hub_delivery_failed");
@@ -265,7 +291,7 @@ export class HubReview {
         this.log("hub_review_already_processed"); return "processed";
       }
       this.deliveries.recordReviewer(row.draft_id, pending.discord_id);
-      await this.finishDecision(row, pending.decision);
+      await this.finishDecision(row, pending.decision, pending.display_name);
       this.log(pending.decision === "approved" ? "hub_review_approved" : "hub_review_rejected");
       return "done";
     } finally { this.sending.delete(row.draft_id); }
@@ -281,13 +307,20 @@ export class HubReview {
       if (!row || !row.hub_id || (i.guildId !== null && i.guildId !== row.guild_id) || !this.setting(row)) {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
-      if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。Hub で現在の状態を確認してください。")); return; }
+      // 旧記録に ID がなくても、押された通知から編集先を補う。
+      if (i.notification) this.deliveries.notification(row.draft_id, i.notification);
+      if (row.state === "closed") {
+        unlock = await this.lock(row.draft_id);
+        await this.updateNotifications(row.draft_id);
+        await i.edit(text("この発表はすでに処理済みです。Hub で現在の状態を確認してください。")); return;
+      }
       if (this.sending.get(row.draft_id) === i.userId) {
         await i.edit(text("前の操作を送信中です。結果が出てから押し直してください")); return;
       }
       const decision = match![2] as "approved" | "rejected";
       const pending = this.deliveries.decision(row.draft_id, i.userId);
-      if (!this.deliveries.queueDecision(row.draft_id, decision, i.userId, this.now())) {
+      const displayName = (i.userDisplayName ?? "").replace(/[\r\n]/g, " ").slice(0, 100);
+      if (!this.deliveries.queueDecision(row.draft_id, decision, i.userId, this.now(), displayName)) {
         this.log("hub_review_queue_full");
         await i.edit(text("Hub に接続できません。復旧後にもう一度押してください")); return;
       }

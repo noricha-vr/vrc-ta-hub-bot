@@ -1,8 +1,8 @@
-import { Client, ChannelType, Events, GatewayIntentBits, MessageFlags, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, Client, ChannelType, Events, GatewayIntentBits, MessageFlags, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
 import type { NotificationTarget } from "./hub-store";
 import type { HubView } from "./hub-setup";
 import { discordHubView, hubCommand, hubInteraction, validateHubChannels } from "./discord-hub";
-import type { Gateway, GatewayEvents, GatewayMessage, HistoryQuery } from "./gateway";
+import type { Gateway, GatewayEvents, GatewayMessage, HistoryQuery, NotificationReference } from "./gateway";
 
 export const clientOptions: ClientOptions = {
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -117,18 +117,38 @@ export class DiscordGateway implements Gateway {
     }
   }
 
-  async notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void> {
+  async notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<NotificationReference> {
     const payload = { ...discordHubView(view), nonce, enforceNonce: true, flags: MessageFlags.SuppressEmbeds as const };
     if (target.type === "dm") {
       const user = await this.client.users.fetch(target.userId);
-      await user.send(payload);
-      return;
+      const message = await user.send(payload);
+      return { channelId: message.channelId, messageId: message.id };
     }
     const channel = await this.client.channels.fetch(target.channelId);
     if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) || channel.guildId !== guildId) {
       throw new Error("Notification channel must belong to configured guild");
     }
-    await channel.send(payload);
+    const message = await channel.send(payload);
+    return { channelId: message.channelId, messageId: message.id };
+  }
+
+  async editNotification(reference: NotificationReference, result: string): Promise<void> {
+    const channel = await this.client.channels.fetch(reference.channelId);
+    if (!channel || (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
+      throw new Error("Invalid notification channel");
+    }
+    const message = await channel.messages.fetch({ message: reference.messageId, cache: false });
+    if (message.author.id !== this.client.user?.id) throw new Error("Notification must belong to this bot");
+    const components = message.components.flatMap(row => {
+      if (!("components" in row)) return [];
+      const links = row.components.flatMap(component => component.type === ComponentType.Button && component.style === ButtonStyle.Link
+        ? [ButtonBuilder.from(component)] : []);
+      return links.length ? [new ActionRowBuilder<ButtonBuilder>().addComponents(links)] : [];
+    });
+    // 応答を失った編集の再試行でも結果行は一つにする。
+    const content = message.content.replace(/\n(?:承認済み|却下)(?:（[^\r\n]*）)?$/, "");
+    await message.edit({ content: `${content}\n${result}`, components,
+      allowedMentions: { parse: [], repliedUser: false }, flags: MessageFlags.SuppressEmbeds });
   }
 
   /** SDK のキャッシュや短時間の nonce 重複排除に頼らず、自分の通知を照合する。 */

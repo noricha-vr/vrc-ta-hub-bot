@@ -33,6 +33,8 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   let eventsDown = false;
   let patchDown = false;
   let notifyDown = false;
+  let editDown = false;
+  const edits: Array<{ reference: { channelId: string; messageId: string }; result: string }> = [];
   let lookupDown = false;
   let createFailure: "none" | "lost" | "unconfirmed" | "saved" | "unreadable" = "none";
   let createStatus = 201;
@@ -98,6 +100,10 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   const gateway = { notify: async (guildId: string, target: NotificationTarget, view: HubView, nonce: string) => {
     if (notifyDown) throw new Error("Synthetic notification failure");
     notifications.push({ guildId, target, view, nonce });
+    return { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(500 + notifications.length) };
+  }, editNotification: async (reference: { channelId: string; messageId: string }, result: string) => {
+    edits.push({ reference, result });
+    if (editDown) throw new Error("Synthetic edit failure");
   } };
   const makeReview = () => new HubReview(gateway, settings, extracted, deliveries, hub, event => log.push(event), () => now);
   let review = makeReview();
@@ -109,7 +115,8 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
     [{ kind: "pdf", url: `https://example.invalid/${id}.pdf` }], { ...source, messageId: id, url: `https://discord.com/channels/100/10/${id}` });
   cleanups.push(() => { deliveries.close(); extracted.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
   return {
-    get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp,
+    get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp, edits,
+    setEditDown: (value: boolean) => { editDown = value; },
     get review() { return review; }, get deliveries() { return deliveries; }, get createCount() { return createCount; },
     get savedCount() { return savedCount; },
     advance: (seconds = 30000) => { now += seconds; },
@@ -1179,4 +1186,83 @@ test("通知の出典は通知先のサーバーのものを選ぶ", () => {
   expect(sourceFor({ sources: [old, fresh] }, "200")).toBe(fresh.url);
   expect(sourceFor({ sources: [old, fresh] }, "100")).toBe(old.url);
   expect(sourceFor({ sources: [old] }, "300")).toBe(old.url);
+});
+
+for (const decision of ["approved", "rejected"] as const) test(`通知の ${decision} を表示名付きで確定する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const { i } = interaction(draft.id, decision);
+  await f.review.handle({ ...i, userDisplayName: "運営 @everyone *担当*\n次行" });
+  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "501" },
+    result: `${decision === "approved" ? "承認済み" : "却下"}（運営 ＠everyone \\*担当\\* 次行）` }]);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+  expect(f.deliveries.decisions(draft.id)).toEqual([]);
+  f.reopen(); f.advance(); await f.review.flush();
+  expect(f.edits).toHaveLength(1);
+});
+
+for (const status of ["approved", "rejected"] as const) test(`409 の通知は Hub の ${status} を処理者なしで表示する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setReviewStatus(409); f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status }]);
+  await f.review.handle({ ...interaction(draft.id).i, userDisplayName: "今押した人" });
+  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "501" }, result: status === "approved" ? "承認済み" : "却下" }]);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: status });
+});
+
+for (const decision of ["approved", "rejected"] as const) test(`通知編集の失敗後も ${decision} を保ち、再起動後に待ち間隔付きで再試行する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setEditDown(true);
+  await f.review.handle({ ...interaction(draft.id, decision).i, userDisplayName: "運営" });
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+  expect(f.deliveries.decisions(draft.id)).toEqual([]);
+  expect(f.edits).toHaveLength(1);
+  expect(f.deliveries.counts().retry).toBe(1);
+  f.reopen(); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.advance(300); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.reopen(); f.setEditDown(false); f.advance(599); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.edits.at(-1)?.result).toBe(`${decision === "approved" ? "承認済み" : "却下"}（運営）`);
+  expect(f.deliveries.counts().retry).toBe(0);
+  f.reopen(); f.advance(); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
+  expect(f.notifications).toHaveLength(1);
+});
+
+test("再送待ちの判断の表示名も再起動後に通知へ反映する", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+  await f.review.handle({ ...interaction(draft.id).i, userDisplayName: "集会の運営" });
+  expect(f.edits).toEqual([]);
+  f.reopen(); f.setReviewStatus(200); f.advance(300); await f.review.flush();
+  expect(f.edits.at(-1)?.result).toBe("承認済み（集会の運営）");
+});
+
+test("続報で通知し直した場合は元の通知もすべて編集する", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.followUp(draft); await f.review.flush();
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.edits.map(e => e.reference.messageId)).toEqual(["501", "502"]);
+});
+
+for (const alreadyClosed of [false, true]) test(`ID のない旧通知は押された通知から編集先を補う（処理済み: ${alreadyClosed}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try { db.exec("DELETE FROM hub_review_notifications"); } finally { db.close(); }
+  if (alreadyClosed) f.deliveries.closed(draft.id, "approved", "元の処理者");
+  await f.review.handle({ ...interaction(draft.id).i, userDisplayName: "今押した人",
+    notification: { channelId: "11", messageId: "499" } });
+  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "499" },
+    result: `承認済み（${alreadyClosed ? "元の処理者" : "今押した人"}）` }]);
+  f.reopen(); f.advance(); await f.review.flush();
+  expect(f.edits).toHaveLength(1);
+});
+
+for (const status of ["approved", "rejected"] as const) test(`409 確定後の通知編集失敗も再起動後に ${status} として再試行する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setReviewStatus(409); f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status }]);
+  f.setEditDown(true); await f.review.handle({ ...interaction(draft.id).i, userDisplayName: "今押した人" });
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: status });
+  expect(f.deliveries.decisions(draft.id)).toEqual([]);
+  f.reopen(); f.setEditDown(false); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.advance(300); await f.review.flush();
+  expect(f.edits).toHaveLength(2);
+  expect(f.edits.at(-1)?.result).toBe(status === "approved" ? "承認済み" : "却下");
+  expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { HubCommunity, HubLookup } from "./hub-api";
 import { HubStore, type NotificationTarget } from "./hub-store";
 import type { HubReview } from "./hub-review";
+import type { NotificationReference } from "./gateway";
 
 export type HubControl =
   | { type: "select"; id: string; options: Array<{ label: string; value: string }> }
@@ -11,6 +12,8 @@ export interface HubView { content: string; controls: HubControl[] }
 export interface HubInteraction {
   guildId: string | null;
   userId: string;
+  userDisplayName?: string;
+  notification?: NotificationReference;
   kind: "command" | "component";
   action: string;
   values: string[];

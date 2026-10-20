@@ -38,6 +38,10 @@ export function hubInteraction(interaction: Interaction): HubInteraction | undef
   if (!(interaction.isChatInputCommand() || interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isButton())) return;
   return {
     guildId: interaction.guildId, userId: interaction.user.id,
+    userDisplayName: interaction.member && "displayName" in interaction.member
+      ? interaction.member.displayName : interaction.member?.nick ?? interaction.user.displayName,
+    ...(interaction.isButton() && interaction.message
+      ? { notification: { channelId: interaction.channelId, messageId: interaction.message.id } } : {}),
     kind: command ? "command" : "component",
     action: interaction.isChatInputCommand() ? interaction.options.getSubcommand() : interaction.customId,
     values: interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() ? interaction.values : [],

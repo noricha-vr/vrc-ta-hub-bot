@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { ReviewDecision } from "./hub-api";
+import type { NotificationReference } from "./gateway";
 
 const MAX_PENDING_REVIEWS = 5;
 
@@ -16,6 +17,7 @@ export interface HubDelivery {
   attempts: number;
   next_at: number;
   reason: string;
+  reviewer_display_name: string;
 }
 
 export interface HubReviewDecision {
@@ -25,6 +27,16 @@ export interface HubReviewDecision {
   attempts: number;
   next_at: number;
   created_at: number;
+  display_name: string;
+}
+
+export interface HubReviewNotification {
+  draft_id: string;
+  channel_id: string;
+  message_id: string;
+  edited: number;
+  attempts: number;
+  next_at: number;
 }
 
 export interface HubReviewStats {
@@ -59,10 +71,20 @@ export class HubDeliveryStore {
         guild_id TEXT NOT NULL, community_id INTEGER NOT NULL, discord_id TEXT NOT NULL,
         PRIMARY KEY (guild_id, community_id, discord_id)
       );
+      CREATE TABLE IF NOT EXISTS hub_review_notifications (
+        draft_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+        edited INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (channel_id, message_id)
+      );
     `);
     // 旧形式の保留と再送時刻を、取り込み済みの行を上書きせずに移す。
     this.db.transaction(() => {
       const now = Math.floor(Date.now() / 1000);
+      for (const [table, column] of [["hub_deliveries", "reviewer_display_name"], ["hub_review_decisions", "display_name"]]) {
+        if (!this.db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some(c => c.name === column)) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+        }
+      }
       if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_deliveries)").all().some(c => c.name === "source_url")) {
         this.db.exec("ALTER TABLE hub_deliveries ADD COLUMN source_url TEXT NOT NULL DEFAULT ''");
       }
@@ -113,8 +135,31 @@ export class HubDeliveryStore {
       reason = CASE WHEN state = 'closed' THEN reason ELSE '' END
       WHERE draft_id = ? AND (state <> 'closed' OR reason IN ('approved', 'rejected'))`).run(hash, id);
   }
-  notified(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
+  notified(id: string, hash: string, reference?: NotificationReference): void {
+    this.db.transaction(() => {
+      if (reference) this.notification(id, reference);
+      this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
+    })();
+  }
+  notification(id: string, reference: NotificationReference): void {
+    this.db.query(`INSERT OR IGNORE INTO hub_review_notifications (draft_id, channel_id, message_id) VALUES (?, ?, ?)`)
+      .run(id, reference.channelId, reference.messageId);
+  }
+  dueNotifications(now: number, id?: string): HubReviewNotification[] {
+    return this.db.query<HubReviewNotification, [number, string | null, string | null]>(`SELECT n.* FROM hub_review_notifications n
+      JOIN hub_deliveries d ON d.draft_id = n.draft_id
+      WHERE d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0 AND n.next_at <= ?
+        AND (? IS NULL OR n.draft_id = ?) ORDER BY n.rowid`).all(now, id ?? null, id ?? null);
+  }
+  notificationEdited(row: HubReviewNotification): void {
+    this.db.query("UPDATE hub_review_notifications SET edited = 1, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ?")
+      .run(row.channel_id, row.message_id);
+  }
+  retryNotification(row: HubReviewNotification, now: number): void {
+    const attempts = row.attempts + 1;
+    const delay = Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
+    this.db.query("UPDATE hub_review_notifications SET attempts = ?, next_at = ? WHERE channel_id = ? AND message_id = ? AND edited = 0")
+      .run(attempts, now + delay, row.channel_id, row.message_id);
   }
   retry(id: string, now: number, reason: string): void {
     const attempts = (this.get(id)?.attempts ?? 0) + 1;
@@ -123,18 +168,18 @@ export class HubDeliveryStore {
       WHERE draft_id = ? AND (state <> 'closed' OR reason IN ('approved', 'rejected'))`)
       .run(attempts, now + delay, reason, id);
   }
-  queueDecision(id: string, decision: ReviewDecision, discordId: string, now = Math.floor(Date.now() / 1000)): boolean {
+  queueDecision(id: string, decision: ReviewDecision, discordId: string, now = Math.floor(Date.now() / 1000), displayName = ""): boolean {
     return this.db.query(`WITH reviewers AS (
         SELECT v.discord_id FROM hub_reviewers v JOIN hub_deliveries d
           ON v.guild_id = d.guild_id AND v.community_id = d.community_id WHERE d.draft_id = ?
-      ) INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at)
-      SELECT ?, ?, ?, ? WHERE EXISTS (
+      ) INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at, display_name)
+      SELECT ?, ?, ?, ?, ? WHERE EXISTS (
         SELECT 1 FROM hub_review_decisions WHERE draft_id = ? AND discord_id = ?
       ) OR ? IN (SELECT discord_id FROM reviewers) OR (
         SELECT count(*) FROM hub_review_decisions WHERE draft_id = ? AND discord_id NOT IN (SELECT discord_id FROM reviewers)
       ) < ${MAX_PENDING_REVIEWS}
-      ON CONFLICT (draft_id, discord_id) DO UPDATE SET decision = excluded.decision`)
-      .run(id, id, discordId, decision, now, id, discordId, discordId, id).changes > 0;
+      ON CONFLICT (draft_id, discord_id) DO UPDATE SET decision = excluded.decision, display_name = excluded.display_name`)
+      .run(id, id, discordId, decision, now, displayName, id, discordId, discordId, id).changes > 0;
   }
   decision(id: string, discordId: string): HubReviewDecision | undefined {
     return this.db.query<HubReviewDecision, [string, string]>(
@@ -147,7 +192,7 @@ export class HubDeliveryStore {
     ).all(id);
   }
   dueDecisions(now: number): HubReviewDecision[] {
-    return this.db.query<HubReviewDecision, [number]>(`SELECT draft_id, discord_id, decision, attempts, next_at, created_at FROM (
+    return this.db.query<HubReviewDecision, [number]>(`SELECT draft_id, discord_id, decision, attempts, next_at, created_at, display_name FROM (
       SELECT r.*, r.rowid AS review_order, (v.discord_id IS NOT NULL) AS verified, row_number() OVER (
         PARTITION BY r.draft_id, (v.discord_id IS NOT NULL) ORDER BY r.created_at, r.rowid
       ) AS position FROM hub_review_decisions r
@@ -178,10 +223,10 @@ export class HubDeliveryStore {
   clearDecision(id: string, discordId: string): void {
     this.db.query("DELETE FROM hub_review_decisions WHERE draft_id = ? AND discord_id = ?").run(id, discordId);
   }
-  closed(id: string, reason: string): void {
+  closed(id: string, reason: string, displayName = ""): void {
     this.db.transaction(() => {
-      this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, attempts = 0, next_at = 0, decision = NULL, discord_id = NULL WHERE draft_id = ?")
-        .run(reason, id);
+      this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, reviewer_display_name = ?, attempts = 0, next_at = 0, decision = NULL, discord_id = NULL WHERE draft_id = ?")
+        .run(reason, displayName, id);
       this.db.query("DELETE FROM hub_review_decisions WHERE draft_id = ?").run(id);
     })();
   }
@@ -196,7 +241,9 @@ export class HubDeliveryStore {
       WHERE EXISTS (
         SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
       ) AND (
-        (state = 'closed' AND reason IN ('approved', 'rejected') AND attempts > 0) OR
+        (state = 'closed' AND reason IN ('approved', 'rejected') AND (attempts > 0 OR EXISTS (
+          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.edited = 0
+        ))) OR
         (state <> 'closed' AND (reason <> '' OR EXISTS (
           SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
         )))
