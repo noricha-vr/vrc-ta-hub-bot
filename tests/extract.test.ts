@@ -366,7 +366,8 @@ test("文中の引用は 1 組だけ切り出し、曖昧な引用や不正な�
   expect(extractTitle(`発表「${"a".repeat(80)}」をします`)).toBe("a".repeat(80));
   for (const line of ["「A」と「B」", "『A』と『B』", "「A」と『B』", "タイトル「A」と「B」", "発表「A『B』」をします",
     "発表「A』をします", "発表「A」をします「", "発表「」をします", "発表『  』をします", `発表『${"a".repeat(81)}』をします`,
-    "発表「https://example.invalid/x」をします", "発表『<@123>』をします", "発表「@everyone」をします", "発表『@here』をします"]) {
+    "発表「https://example.invalid/x」をします", "発表『<@123>』をします", "発表「@everyone」をします", "発表『@here』をします",
+    "10/23 に応募します。題名: 型の話。補足は「欠席」です", "応募します タイトル：型の話 補足『欠席』", "応募します、Title: 型の話（「欠席」）"]) {
     expect(extractTitle(line)).toBeUndefined();
   }
 });

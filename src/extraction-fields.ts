@@ -44,6 +44,8 @@ export const MAX_TITLE_LENGTH = 80;
 const QUOTED = /^(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』|"([^「」『』"“”]+)"|“([^「」『』"“”]+)”)$/;
 const INLINE_QUOTED = /^[^「」『』]*(?:「([^「」『』"“”]+)」|『([^「」『』"“”]+)』)[^「」『』]*$/;
 const LABELLED = /^(?:題名|タイトル|演題|title)(?:\s*[:：]\s*|\s+)(.+)$/i;
+// 行の途中のラベル。文中の引用を題名として採る前に、ラベル付きの題名と食い違わないか見る。
+const EMBEDDED_LABEL = /(?:題名|タイトル|演題|title)\s*[:：]/i;
 const PLAIN_FORBIDDEN = /[。．.!?！？、，,「」『』"“”]/;
 const UNSAFE = /https?:\/\/|<@|@everyone|@here/i;
 
@@ -62,7 +64,7 @@ export function extractTitle(line: string): string | undefined {
   const text = line.trim().replace(/。$/, "").trim();
   const label = LABELLED.exec(text)?.[1]?.trim();
   const title = label === undefined
-    ? quotedTitle(text) ?? quotedTitle(text, INLINE_QUOTED)
+    ? quotedTitle(text) ?? (EMBEDDED_LABEL.test(text) ? undefined : quotedTitle(text, INLINE_QUOTED))
     : quotedTitle(label) ?? (PLAIN_FORBIDDEN.test(label) ? undefined : label);
   if (!title || [...title].length > MAX_TITLE_LENGTH || UNSAFE.test(title)) return undefined;
   return title;
