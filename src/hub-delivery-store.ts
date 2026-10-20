@@ -14,6 +14,8 @@ export interface HubDelivery {
   source_url: string;
   synced_hash: string;
   notified_hash: string;
+  notification_target: string;
+  notification_attempted_at: number;
   attempts: number;
   next_at: number;
   reason: string;
@@ -34,6 +36,8 @@ export interface HubReviewNotification {
   draft_id: string;
   channel_id: string;
   message_id: string;
+  content_hash: string;
+  target_key: string;
   edited: number;
   attempts: number;
   next_at: number;
@@ -84,6 +88,16 @@ export class HubDeliveryStore {
       const now = Math.floor(Date.now() / 1000);
       if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_review_notifications)").all().some(c => c.name === "closed_reason")) {
         this.db.exec("ALTER TABLE hub_review_notifications ADD COLUMN closed_reason TEXT NOT NULL DEFAULT ''");
+      }
+      for (const column of ["content_hash", "target_key"]) {
+        if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_review_notifications)").all().some(c => c.name === column)) {
+          this.db.exec(`ALTER TABLE hub_review_notifications ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+        }
+      }
+      for (const [column, definition] of [["notification_target", "TEXT NOT NULL DEFAULT ''"], ["notification_attempted_at", "INTEGER NOT NULL DEFAULT 0"]]) {
+        if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_deliveries)").all().some(c => c.name === column)) {
+          this.db.exec(`ALTER TABLE hub_deliveries ADD COLUMN ${column} ${definition}`);
+        }
       }
       for (const [table, column] of [["hub_deliveries", "reviewer_display_name"], ["hub_review_decisions", "display_name"]]) {
         if (!this.db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some(c => c.name === column)) {
@@ -140,34 +154,52 @@ export class HubDeliveryStore {
       reason = CASE WHEN state = 'closed' THEN reason ELSE '' END
       WHERE draft_id = ? AND (state <> 'closed' OR reason IN ('approved', 'rejected'))`).run(hash, id);
   }
-  notified(id: string, hash: string, reference?: NotificationReference): void {
+  reserveNotification(id: string, targetKey: string, now: number): void {
+    this.db.query(`UPDATE hub_deliveries SET notification_target = ?, notification_attempted_at = ?
+      WHERE draft_id = ? AND state = 'ready' AND notification_target <> ?`).run(targetKey, now, id, targetKey);
+  }
+  notified(id: string, hash: string, reference?: NotificationReference, targetKey = "", recovered = false): void {
     this.db.transaction(() => {
-      if (reference) this.notification(id, reference);
-      this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
+      if (reference) {
+        this.notification(id, reference);
+        this.db.query(`UPDATE hub_review_notifications SET target_key = ?, content_hash = ?
+          WHERE channel_id = ? AND message_id = ?`)
+          .run(targetKey, recovered ? "" : this.get(id)!.synced_hash, reference.channelId, reference.messageId);
+      }
+      this.db.query("UPDATE hub_deliveries SET notified_hash = ?, notification_target = '', notification_attempted_at = 0, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
     })();
   }
   notification(id: string, reference: NotificationReference): void {
     this.db.query(`INSERT OR IGNORE INTO hub_review_notifications (draft_id, channel_id, message_id) VALUES (?, ?, ?)`)
       .run(id, reference.channelId, reference.messageId);
   }
+  notifications(id: string): HubReviewNotification[] {
+    return this.db.query<HubReviewNotification, [string]>("SELECT * FROM hub_review_notifications WHERE draft_id = ? ORDER BY rowid").all(id);
+  }
   dueNotifications(now: number, id?: string): HubReviewNotification[] {
     return this.db.query<HubReviewNotification, [number, string | null, string | null]>(`SELECT n.* FROM hub_review_notifications n
       JOIN hub_deliveries d ON d.draft_id = n.draft_id
-      WHERE d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0 AND n.closed_reason = '' AND n.next_at <= ?
+      WHERE ((d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0)
+        OR (d.state = 'ready' AND n.content_hash <> d.synced_hash))
+        AND n.closed_reason = '' AND n.next_at <= ?
         AND (? IS NULL OR n.draft_id = ?) ORDER BY n.rowid`).all(now, id ?? null, id ?? null);
+  }
+  notificationUpdated(row: HubReviewNotification, hash: string): void {
+    this.db.query("UPDATE hub_review_notifications SET content_hash = ?, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ?")
+      .run(hash, row.channel_id, row.message_id);
   }
   notificationEdited(row: HubReviewNotification): void {
     this.db.query("UPDATE hub_review_notifications SET edited = 1, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ?")
       .run(row.channel_id, row.message_id);
   }
   notificationClosed(row: HubReviewNotification, reason: "unknown_message" | "unknown_channel" | "not_found"): void {
-    this.db.query("UPDATE hub_review_notifications SET closed_reason = ?, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ? AND edited = 0")
+    this.db.query("UPDATE hub_review_notifications SET closed_reason = ?, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ?")
       .run(reason, row.channel_id, row.message_id);
   }
   retryNotification(row: HubReviewNotification, now: number, forbidden = false): void {
     const attempts = row.attempts + 1;
     const delay = forbidden ? 21600 : Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
-    this.db.query("UPDATE hub_review_notifications SET attempts = ?, next_at = ? WHERE channel_id = ? AND message_id = ? AND edited = 0 AND closed_reason = ''")
+    this.db.query("UPDATE hub_review_notifications SET attempts = ?, next_at = ? WHERE channel_id = ? AND message_id = ? AND closed_reason = ''")
       .run(attempts, now + delay, row.channel_id, row.message_id);
   }
   retry(id: string, now: number, reason: string): void {
@@ -254,6 +286,8 @@ export class HubDeliveryStore {
           SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.edited = 0 AND n.closed_reason = ''
         ))) OR
         (state <> 'closed' AND (reason <> '' OR EXISTS (
+          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.attempts > 0 AND n.closed_reason = ''
+        ) OR EXISTS (
           SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
         )))
       )`).get()!.n;

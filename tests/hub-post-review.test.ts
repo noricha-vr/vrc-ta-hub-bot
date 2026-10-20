@@ -76,7 +76,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     if (url.pathname === "/api/v1/event/") return Response.json([]);
     throw new Error("Unexpected fake Hub request");
   });
-  const notifier: HubPostReviewGateway = { editNotification: async (reference, result, removeLinks) => {
+  const notifier: HubPostReviewGateway = { updateNotification: async () => {}, editNotification: async (reference, result, removeLinks) => {
     edits.push({ reference, result, removeLinks });
     if (editError) throw editError;
   }, findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {

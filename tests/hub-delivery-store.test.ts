@@ -199,3 +199,29 @@ test("作成時の出典を再起動と取り外し後も保持し、未作成�
     expect(store.get("draft")).toMatchObject({ state: "queued", source_url: "", attempted_hash: "" });
   } finally { store.close(); }
 });
+
+test("本文の編集待ちは再起動後も保持し、本文編集済みでも確定後の結果を編集する", () => {
+  const path = databasePath(); let store = new HubDeliveryStore(path);
+  try {
+    store.enqueue("draft", "100", 1); store.created("draft", 42, "first");
+    store.notified("draft", "notice", { channelId: "11", messageId: "501" }, "target");
+    expect(store.dueNotifications(1000)).toEqual([]);
+    store.synced("draft", "second");
+    const pending = store.dueNotifications(1000)[0]!;
+    expect(pending).toMatchObject({ content_hash: "first", target_key: "target", edited: 0 });
+    store.retryNotification(pending, 1000);
+    store.close(); store = new HubDeliveryStore(path);
+    expect(store.dueNotifications(1299)).toEqual([]); expect(store.counts().retry).toBe(1);
+    const retry = store.dueNotifications(1300)[0]!;
+    expect(retry).toMatchObject({ attempts: 1, next_at: 1300, content_hash: "first" });
+    store.notificationUpdated(retry, "second");
+    expect(store.dueNotifications(1300)).toEqual([]); expect(store.counts().retry).toBe(0);
+    store.closed("draft", "approved");
+    const result = store.dueNotifications(1300)[0]!;
+    expect(result).toMatchObject({ edited: 0, content_hash: "second" });
+    store.notificationEdited(result); store.synced("draft", "third");
+    store.close(); store = new HubDeliveryStore(path);
+    expect(store.dueNotifications(Number.MAX_SAFE_INTEGER)).toEqual([]);
+    expect(store.notifications("draft")[0]).toMatchObject({ edited: 1, content_hash: "second" });
+  } finally { store.close(); }
+});

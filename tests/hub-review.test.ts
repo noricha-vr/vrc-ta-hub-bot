@@ -28,6 +28,9 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   let deliveries = new HubDeliveryStore(path);
   const log: string[] = [];
   const notifications: Array<{ guildId: string; target: NotificationTarget; view: HubView; nonce: string }> = [];
+  const updates: Array<{ reference: { channelId: string; messageId: string }; view: HubView }> = [];
+  let notifyLost = false;
+  let notificationLookupUnknown = false;
   const calls: Array<{ path: string; method: string; body?: Record<string, unknown> }> = [];
   let now = 1000;
   let eventsDown = false;
@@ -101,23 +104,34 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   const gateway = { notify: async (guildId: string, target: NotificationTarget, view: HubView, nonce: string) => {
     if (notifyDown) throw new Error("Synthetic notification failure");
     notifications.push({ guildId, target, view, nonce });
+    if (notifyLost) throw new Error("Synthetic lost notification response");
     return { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(500 + notifications.length) };
   }, editNotification: async (reference: { channelId: string; messageId: string }, result: string) => {
     edits.push({ reference, result });
     if (editError) throw editError;
     if (editDown) throw new Error("Synthetic edit failure");
+  }, updateNotification: async (reference: { channelId: string; messageId: string }, view: HubView) => {
+    updates.push({ reference, view });
+    if (editError) throw editError;
+    if (editDown) throw new Error("Synthetic edit failure");
+  }, findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
+    if (notificationLookupUnknown) return "unknown" as const;
+    const index = notifications.findIndex(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
+    return index < 0 ? false : { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(501 + index) };
   } };
   const makeReview = () => new HubReview(gateway, settings, extracted, deliveries, hub, event => log.push(event), () => now);
   let review = makeReview();
   settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "channel", channelId: "11" } }, "100");
-  const create = (presenterId = userId, messageId = "101") => extracted.create({ meetingId: "1", presenterId, presenterName: "発表者 <@123>",
-    eventDate: "2026-10-25", title: "題名 <script>", materials: [{ kind: "slides", url: "https://example.invalid/slides/one" }] },
+  const create = (presenterId = userId, messageId = "101", materials: TalkDraft["materials"] = [{ kind: "slides", url: "https://example.invalid/slides/one" }]) => extracted.create({ meetingId: "1", presenterId, presenterName: "発表者 <@123>",
+    eventDate: "2026-10-25", title: "題名 <script>", materials },
     { ...source, messageId, url: `https://discord.com/channels/100/10/${messageId}` }).draft;
   const followUp = (draft: TalkDraft, id = "102") => extracted.addFollowUp(draft.id,
     [{ kind: "pdf", url: `https://example.invalid/${id}.pdf` }], { ...source, messageId: id, url: `https://discord.com/channels/100/10/${id}` });
   cleanups.push(() => { deliveries.close(); extracted.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
   return {
-    get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp, edits,
+    get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp, edits, updates,
+    setNotifyLost: (value: boolean) => { notifyLost = value; },
+    setNotificationLookupUnknown: (value: boolean) => { notificationLookupUnknown = value; },
     setEditDown: (value: boolean) => { editDown = value; },
     setEditError: (value: unknown) => { editError = value; },
     get review() { return review; }, get deliveries() { return deliveries; }, get createCount() { return createCount; },
@@ -175,7 +189,8 @@ test("作成前に記録し pending・出典・X-API-Key で登録し、設定�
   expect(lines[1]).toMatch(/^日付：\d{4}-\d{2}-\d{2}\([日月火水木金土]\)$/);
   expect(lines[2]).toStartWith("発表者：");
   expect(lines[3]).toStartWith("テーマ：");
-  expect(lines[4]).toBe(source.url);
+  expect(lines[4]).toBe("資料：https://example.invalid/slides/one");
+  expect(lines[5]).toBe(source.url);
   expect(f.notifications[0]!.view.controls).toEqual([{ type: "buttons", buttons: [
     { id: `hub-review:${draft.id}:approved`, label: "承認" },
     { url: "https://example.invalid/event/detail/42/update/", label: "直す" },
@@ -193,8 +208,13 @@ test("重複受信・再起動でも作成と通知を繰り返さず、続報�
   expect(patch.path).toBe("/api/v1/event-details/42/");
   expect(patch.body).toEqual({ slide_url: "https://example.invalid/slides/one",
     additional_info: "https://example.invalid/slides/one\nhttps://example.invalid/102.pdf" });
-  expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(2);
-  expect(f.notifications[0]!.nonce).not.toBe(f.notifications[1]!.nonce);
+  expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(1);
+  expect(f.updates).toHaveLength(1);
+  expect(f.updates[0]!.reference).toEqual({ channelId: "11", messageId: "501" });
+  expect(f.updates[0]!.view.content).toContain("テーマ：題名 ");
+  expect(f.updates[0]!.view.content.split("\n")[4]).toBe("資料：https://example.invalid/slides/one ほか 1 件");
+  expect(f.updates[0]!.view.controls).toEqual(f.notifications[0]!.view.controls);
+  f.reopen(); await f.review.flush(); expect(f.updates).toHaveLength(1);
 });
 
 test("Hub 停止中は送信待ちを保持し、再起動後の復旧で取りこぼさず送る", async () => {
@@ -282,13 +302,14 @@ for (const status of ["archived", "", undefined, null, 42]) test(`作成照合�
   expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(1);
 });
 
-test("PATCH と通知の失敗は再送し、新たな下書きを作らない", async () => {
+test("PATCH と通知編集の失敗は再試行し、新たな下書きや通知を作らない", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   f.followUp(draft); f.setPatchDown(true); await f.review.flush();
   expect(f.notifications).toHaveLength(1);
-  f.advance(); f.setPatchDown(false); f.setNotifyDown(true); await f.review.flush();
-  f.advance(); f.setNotifyDown(false); await f.review.flush();
-  expect(f.notifications).toHaveLength(2); expect(f.createCount).toBe(1);
+  f.advance(); f.setPatchDown(false); f.setEditDown(true); await f.review.flush();
+  f.advance(); f.setEditDown(false); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.createCount).toBe(1);
+  expect(f.updates).toHaveLength(2);
   expect(f.calls.filter(c => c.method === "PATCH")).toHaveLength(2);
 });
 
@@ -1331,7 +1352,7 @@ test("flush の配送一覧を読んだ後にボタンで閉じた下書きに�
     const before = f.calls.length;
     release(); await flushing;
     expect(f.calls.slice(before).some(c => c.path === "/api/v1/event-details/43/" && c.method === "PATCH")).toBe(false);
-    expect(f.notifications).toHaveLength(3);
+    expect(f.notifications).toHaveLength(2);
   } finally { release(); await flushing; }
 });
 
@@ -1445,9 +1466,9 @@ test("再送待ちの判断の表示名も再起動後に通知へ反映する",
   expect(f.edits.at(-1)?.result).toBe("承認済み（集会の運営）");
 });
 
-test("続報で通知し直した場合は元の通知もすべて編集する", async () => {
+test("旧版で複数届いている通知は承認時にすべて編集する", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
-  f.followUp(draft); await f.review.flush();
+  f.deliveries.notification(draft.id, { channelId: "11", messageId: "502" });
   await f.review.handle(interaction(draft.id).i);
   expect(f.edits.map(e => e.reference.messageId)).toEqual(["501", "502"]);
 });
@@ -1476,4 +1497,79 @@ for (const status of ["approved", "rejected"] as const) test(`409 確定後の�
   expect(f.edits).toHaveLength(2);
   expect(f.edits.at(-1)?.result).toBe(status === "approved" ? "承認済み" : "却下");
   expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
+});
+
+for (const lost of [false, true]) test(`通知が届く前の続報は再起動後も一通だけ通知する（成否不明: ${lost}）`, async () => {
+  const f = fixture(); const draft = f.create();
+  f.setNotifyDown(!lost); f.setNotifyLost(lost); await f.review.flush();
+  f.followUp(draft); f.reopen(); f.advance(300); f.setNotifyDown(false); f.setNotifyLost(false);
+  await f.review.flush(); await f.review.flush();
+  expect(f.notifications).toHaveLength(1);
+  const view = f.updates.at(-1)?.view ?? f.notifications[0]!.view;
+  expect(view.content).toContain("資料：https://example.invalid/slides/one ほか 1 件");
+  if (lost) expect(f.updates.at(-1)?.reference.messageId).toBe("501");
+});
+
+test("成否を照合できない通知は続報があっても再送せず、照合後に編集する", async () => {
+  const f = fixture(); const draft = f.create(); f.setNotifyLost(true); await f.review.flush();
+  f.followUp(draft); f.reopen(); f.advance(300); f.setNotifyLost(false); f.setNotificationLookupUnknown(true);
+  await f.review.flush(); expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(0);
+  f.setNotificationLookupUnknown(false); f.advance(600); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(1);
+});
+
+for (const decision of ["approved", "rejected"]) test(`続報の編集待ちがあっても ${decision} の結果表示に戻らない`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditDown(true); f.followUp(draft); await f.review.flush();
+  await f.review.handle({ ...interaction(draft.id, decision).i, userDisplayName: "運営" });
+  f.setEditDown(false); f.followUp(draft, "103"); f.reopen(); f.advance(300); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(1);
+  expect(f.edits.at(-1)?.result).toBe(`${decision === "approved" ? "承認済み" : "却下"}（運営）`);
+  const count = f.updates.length; f.followUp(draft, "104"); await f.review.flush();
+  expect(f.updates).toHaveLength(count); expect(f.deliveries.get(draft.id)?.reason).toBe(decision);
+});
+
+for (const [error, delay, reason] of [
+  [{ status: 503 }, 300, "retry"], [{ status: 429 }, 300, "retry"],
+  [{ status: 403 }, 21600, "forbidden"], [{ code: 50013 }, 21600, "forbidden"],
+  [{ code: 10008 }, 0, "unknown_message"], [{ code: 10003 }, 0, "unknown_channel"], [{ status: 404 }, 0, "not_found"],
+] as const) test(`続報の通知編集は ${reason} を記録して再試行の間隔と終了を守る (${JSON.stringify(error)})`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditError(error); f.followUp(draft); await f.review.flush();
+  expect(f.updates).toHaveLength(1); expect(f.notifications).toHaveLength(1);
+  expect(f.log).toContain(`hub_review_notification_${reason}`);
+  expect(f.deliveries.counts().retry).toBe(delay ? 1 : 0);
+  f.reopen(); f.followUp(draft, "103"); f.setEditError(undefined);
+  f.advance(delay ? delay - 1 : 30000); await f.review.flush(); expect(f.updates).toHaveLength(1);
+  if (delay) {
+    f.advance(1); await f.review.flush(); expect(f.updates).toHaveLength(2);
+    expect(f.updates.at(-1)?.view.content).toContain("ほか 2 件");
+    expect(f.deliveries.counts().retry).toBe(0);
+  }
+  f.reopen(); f.followUp(draft, "104"); f.advance(30000); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(delay ? 3 : 1);
+});
+
+
+test("資料なしの通知は行を省き、続報の最初の資料を既存通知へ追加する", async () => {
+  const f = fixture(); const draft = f.create(userId, "101", []); await f.review.flush();
+  expect(f.notifications[0]!.view.content.split("\n")[4]).toBe(source.url);
+  f.followUp(draft); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(1);
+  expect(f.updates[0]!.view.content.split("\n")[4]).toBe("資料：https://example.invalid/102.pdf");
+  expect(f.updates[0]!.view.content).not.toContain("ほか");
+});
+
+test("初回の通知は照合不要で送り、送信前の記録を成否不明から復旧するまで保持する", async () => {
+  const f = fixture(); const draft = f.create();
+  f.setNotificationLookupUnknown(true); f.setNotifyLost(true); await f.review.flush();
+  expect(f.notifications).toHaveLength(1);
+  const sending = f.deliveries.get(draft.id)!;
+  expect(sending.notification_target).not.toBe(""); expect(sending.notification_attempted_at).toBe(1000);
+  f.reopen(); f.advance(300); f.setNotifyLost(false); await f.review.flush();
+  expect(f.notifications).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)?.notification_attempted_at).toBe(1000);
+  f.setNotificationLookupUnknown(false); f.advance(600); await f.review.flush();
+  expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ notification_target: "", notification_attempted_at: 0 });
 });
