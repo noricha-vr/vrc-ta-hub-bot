@@ -110,12 +110,17 @@ export class HubDeliveryStore {
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string, now = Math.floor(Date.now() / 1000)): boolean {
-    return this.db.query(`INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at)
+    return this.db.query(`WITH reviewers AS (
+        SELECT v.discord_id FROM hub_reviewers v JOIN hub_deliveries d
+          ON v.guild_id = d.guild_id AND v.community_id = d.community_id WHERE d.draft_id = ?
+      ) INSERT INTO hub_review_decisions (draft_id, discord_id, decision, created_at)
       SELECT ?, ?, ?, ? WHERE EXISTS (
         SELECT 1 FROM hub_review_decisions WHERE draft_id = ? AND discord_id = ?
-      ) OR (SELECT count(*) FROM hub_review_decisions WHERE draft_id = ?) < ${MAX_PENDING_REVIEWS}
+      ) OR ? IN (SELECT discord_id FROM reviewers) OR (
+        SELECT count(*) FROM hub_review_decisions WHERE draft_id = ? AND discord_id NOT IN (SELECT discord_id FROM reviewers)
+      ) < ${MAX_PENDING_REVIEWS}
       ON CONFLICT (draft_id, discord_id) DO UPDATE SET decision = excluded.decision`)
-      .run(id, discordId, decision, now, id, discordId, id).changes > 0;
+      .run(id, id, discordId, decision, now, id, discordId, discordId, id).changes > 0;
   }
   decision(id: string, discordId: string): HubReviewDecision | undefined {
     return this.db.query<HubReviewDecision, [string, string]>(
@@ -129,13 +134,13 @@ export class HubDeliveryStore {
   }
   dueDecisions(now: number): HubReviewDecision[] {
     return this.db.query<HubReviewDecision, [number]>(`SELECT draft_id, discord_id, decision, attempts, next_at, created_at FROM (
-      SELECT r.*, d.rowid AS draft_order, row_number() OVER (
-        PARTITION BY r.draft_id ORDER BY (v.discord_id IS NOT NULL) DESC, r.rowid
+      SELECT r.*, r.rowid AS review_order, (v.discord_id IS NOT NULL) AS verified, row_number() OVER (
+        PARTITION BY r.draft_id, (v.discord_id IS NOT NULL) ORDER BY r.created_at, r.rowid
       ) AS position FROM hub_review_decisions r
       JOIN hub_deliveries d ON d.draft_id = r.draft_id
       LEFT JOIN hub_reviewers v ON v.guild_id = d.guild_id AND v.community_id = d.community_id AND v.discord_id = r.discord_id
       WHERE d.state <> 'closed' AND r.next_at <= ?
-    ) WHERE position <= ${MAX_PENDING_REVIEWS} ORDER BY draft_order, position`).all(now);
+    ) WHERE verified OR position <= ${MAX_PENDING_REVIEWS} ORDER BY verified DESC, created_at, review_order`).all(now);
   }
   recordReviewer(id: string, discordId: string): void {
     this.db.query(`INSERT OR IGNORE INTO hub_reviewers (guild_id, community_id, discord_id)

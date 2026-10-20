@@ -188,7 +188,7 @@ export class HubSetup {
     if (notification.type === "channel") await this.gateway.validateChannels(s.guildId, [notification.channelId], "notify", s.userId);
     if (!this.current(s)) throw new StaleMenuError();
     this.mutate(s.guildId, () => this.store.configure(
-      { guildId: s.guildId, community, channelIds: s.channelIds!, notification }, setupBaseline(this.now()),
+      { guildId: s.guildId, community, channelIds: s.channelIds!, notification }, setupBaseline(this.now()), s.userId,
     ));
     this.log("hub_setup_saved");
     await i.edit(text(`${safeName(community.name)} の設定を保存しました。設定時点より後の投稿を読み取ります。`));

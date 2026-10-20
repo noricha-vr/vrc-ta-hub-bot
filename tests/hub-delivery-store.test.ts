@@ -77,7 +77,7 @@ test("操作者別の旧 DB には開始時刻を補い、件数と待ち時間�
   } finally { store.close(); }
 });
 
-test("上限と再送の 5 件枠は下書きごとに持ち、主催者の実績はサーバーと集会で分ける", () => {
+test("未確認者の上限と再送の 5 件枠は下書きごとに持ち、主催者の実績はサーバーと集会で分ける", () => {
   const store = new HubDeliveryStore(databasePath());
   try {
     for (const [id, guildId, communityId] of [["first", "100", 1], ["same", "100", 1],
@@ -87,20 +87,21 @@ test("上限と再送の 5 件枠は下書きごとに持ち、主催者の実�
     store.recordReviewer("first", "owner"); store.closed("first", "approved");
     for (const id of ["same", "other-community", "other-guild"]) {
       for (const actor of ["1", "2", "3", "4", "owner"]) expect(store.queueDecision(id, "approved", actor, 1000)).toBe(true);
-      expect(store.queueDecision(id, "approved", "sixth", 1001)).toBe(false);
+      expect(store.queueDecision(id, "approved", "sixth", 1001)).toBe(id === "same");
+      expect(store.queueDecision(id, "approved", "seventh", 1001)).toBe(false);
       store.retryDecision(id, "owner", 1000);
       expect(store.queueDecision(id, "rejected", "owner", 1100)).toBe(true);
       expect(store.decision(id, "owner")).toMatchObject({ created_at: 1000, decision: "rejected", attempts: 1, next_at: 1300 });
     }
-    expect(store.dueDecisions(1299)).toHaveLength(12);
+    expect(store.dueDecisions(1299)).toHaveLength(13);
     const due = store.dueDecisions(1300);
-    expect(due).toHaveLength(15);
-    expect(due.filter(r => r.draft_id === "same").map(r => r.discord_id)).toEqual(["owner", "1", "2", "3", "4"]);
+    expect(due).toHaveLength(16);
+    expect(due.filter(r => r.draft_id === "same").map(r => r.discord_id)).toEqual(["owner", "1", "2", "3", "4", "sixth"]);
     for (const id of ["other-community", "other-guild"]) {
       expect(due.filter(r => r.draft_id === id).map(r => r.discord_id)).toEqual(["1", "2", "3", "4", "owner"]);
     }
-    expect(store.pendingReviews(1090)).toEqual({ count: 15, oldestAgeSeconds: 90 });
-    expect(store.pendingReviews(1090, "100", 1)).toEqual({ count: 5, oldestAgeSeconds: 90 });
+    expect(store.pendingReviews(1090)).toEqual({ count: 16, oldestAgeSeconds: 90 });
+    expect(store.pendingReviews(1090, "100", 1)).toEqual({ count: 6, oldestAgeSeconds: 90 });
   } finally { store.close(); }
 });
 

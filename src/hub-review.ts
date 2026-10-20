@@ -18,6 +18,7 @@ const discordText = (value: string) => value.replace(/[\r\n]/g, " ").replace(/@/
 export class HubReview {
   private active: Promise<void> | undefined;
   private readonly busy = new Map<string, Promise<void>>();
+  private readonly sending = new Map<string, string>();
   constructor(
     private readonly gateway: HubReviewGateway,
     private readonly settings: HubStore,
@@ -170,27 +171,30 @@ export class HubReview {
   }
 
   private async submitDecision(row: HubDelivery, pending: HubReviewDecision): Promise<"done" | "forbidden" | "processed"> {
-    try { await this.hub.reviewDraft(row.hub_id!, pending.decision, pending.discord_id); }
-    catch (error) {
-      if (error instanceof HubApiError && error.status === 403) {
-        this.deliveries.clearDecision(row.draft_id, pending.discord_id);
-        this.log("hub_review_forbidden"); return "forbidden";
+    this.sending.set(row.draft_id, pending.discord_id);
+    try {
+      try { await this.hub.reviewDraft(row.hub_id!, pending.decision, pending.discord_id); }
+      catch (error) {
+        if (error instanceof HubApiError && error.status === 403) {
+          this.deliveries.clearDecision(row.draft_id, pending.discord_id);
+          this.log("hub_review_forbidden"); return "forbidden";
+        }
+        if (error instanceof HubApiError && [400, 401, 404, 422, 429].includes(error.status)) throw error;
+        // 409 と成否不明の応答は、他の利用者の保留に関係なく現在状態を照合する。
+        const draft = this.extracted.get(row.draft_id)!;
+        const found = await this.hub.findDraft(draft.sources[0]!.url);
+        if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
+        this.recordDraft(row, draft, found.id, found.status === "approved");
+        this.deliveries.closed(row.draft_id, found.status);
+        this.log("hub_review_already_processed"); return "processed";
       }
-      if (error instanceof HubApiError && [400, 401, 404, 422, 429].includes(error.status)) throw error;
-      // 409 と成否不明の応答は、他の利用者の保留に関係なく現在状態を照合する。
+      this.deliveries.recordReviewer(row.draft_id, pending.discord_id);
       const draft = this.extracted.get(row.draft_id)!;
-      const found = await this.hub.findDraft(draft.sources[0]!.url);
-      if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
-      this.recordDraft(row, draft, found.id, found.status === "approved");
-      this.deliveries.closed(row.draft_id, found.status);
-      this.log("hub_review_already_processed"); return "processed";
-    }
-    this.deliveries.recordReviewer(row.draft_id, pending.discord_id);
-    const draft = this.extracted.get(row.draft_id)!;
-    this.recordDraft(row, draft, row.hub_id!, pending.decision === "approved");
-    this.deliveries.closed(row.draft_id, pending.decision);
-    this.log(pending.decision === "approved" ? "hub_review_approved" : "hub_review_rejected");
-    return "done";
+      this.recordDraft(row, draft, row.hub_id!, pending.decision === "approved");
+      this.deliveries.closed(row.draft_id, pending.decision);
+      this.log(pending.decision === "approved" ? "hub_review_approved" : "hub_review_rejected");
+      return "done";
+    } finally { this.sending.delete(row.draft_id); }
   }
 
   async handle(i: HubInteraction): Promise<void> {
@@ -203,6 +207,9 @@ export class HubReview {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
       if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
+      if (this.sending.get(row.draft_id) === i.userId) {
+        await i.edit(text("前の操作を送信中です。結果が出てから押し直してください")); return;
+      }
       const decision = match![2] as "approved" | "rejected";
       const pending = this.deliveries.decision(row.draft_id, i.userId);
       if (!this.deliveries.queueDecision(row.draft_id, decision, i.userId, this.now())) {

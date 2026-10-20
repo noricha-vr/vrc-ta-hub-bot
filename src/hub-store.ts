@@ -38,6 +38,10 @@ export class HubStore extends MessageStore {
         source_url TEXT NOT NULL, created_at TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS hub_pending_leaves (guild_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS hub_reviewers (
+        guild_id TEXT NOT NULL, community_id INTEGER NOT NULL, discord_id TEXT NOT NULL,
+        PRIMARY KEY (guild_id, community_id, discord_id)
+      );
     `);
     const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(hub_channels)").all();
     if (!columns.some(column => column.name === "cursor")) {
@@ -101,7 +105,7 @@ export class HubStore extends MessageStore {
     }
   }
 
-  configure(setting: Omit<HubSetting, "paused">, baseline: string): void {
+  configure(setting: Omit<HubSetting, "paused">, baseline: string, reviewerId?: string): void {
     if (!setting.channelIds.length || setting.channelIds.length > 25) throw new Error("Invalid channel selection");
     this.db.transaction(() => {
       this.db.query("DELETE FROM hub_pending_leaves WHERE guild_id = ?").run(setting.guildId);
@@ -111,6 +115,8 @@ export class HubStore extends MessageStore {
       this.db.query(`INSERT INTO hub_settings (guild_id, community_id, community, notification, paused) VALUES (?, ?, ?, ?, 0)
         ON CONFLICT (guild_id, community_id) DO UPDATE SET community = excluded.community, notification = excluded.notification, paused = 0`)
         .run(setting.guildId, setting.community.id, JSON.stringify(setting.community), JSON.stringify(setting.notification));
+      if (reviewerId) this.db.query("INSERT OR IGNORE INTO hub_reviewers (guild_id, community_id, discord_id) VALUES (?, ?, ?)")
+        .run(setting.guildId, setting.community.id, reviewerId);
       this.db.query("DELETE FROM hub_channels WHERE guild_id = ? AND community_id = ?").run(setting.guildId, setting.community.id);
       for (const id of new Set(setting.channelIds)) {
         const prior = old.find(row => row.channel_id === id);
