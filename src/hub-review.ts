@@ -184,7 +184,7 @@ export class HubReview {
     if (row.state === "creating") {
       const found = await this.hub.findDraft(source.url);
       if (!found) {
-        this.extracted.holdReview(draft.meetingId, draft.presenterId, source, "hub_create_unconfirmed", this.now(), draft.presenterName);
+        this.extracted.holdReview(draft.meetingId, draft.presenterId, source, "hub_create_unconfirmed", this.now());
         this.deliveries.retry(row.draft_id, this.now(), "hub_create_unconfirmed");
         this.log("hub_create_unconfirmed");
         return;

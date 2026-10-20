@@ -25,11 +25,10 @@ export type NewTalkDraft = Omit<TalkDraft, "id" | "sources">;
 export type SavedDraft = { status: "candidate"; action: "created" | "updated"; draft: TalkDraft }
   | { status: "duplicate"; draft: TalkDraft };
 
-/** 再試行の記録。本文は持たず、取り直すための ID・出典と通知用の表示名を残す。 */
+/** 再試行の記録。本文・表示名は持たず、取り直すための ID・出典・回数・次の時刻を残す。 */
 export interface PendingPost {
   meetingId: string;
   authorId: string;
-  authorDisplayName?: string;
   source: PostReference;
   reason: string;
   attempts: number;
@@ -40,7 +39,6 @@ export interface PendingPost {
 interface PendingRow {
   meeting_id: string;
   author_id: string;
-  author_display_name: string;
   message_id: string;
   channel_id: string;
   source_url: string;
@@ -53,7 +51,6 @@ interface PendingRow {
 const toPending = (row: PendingRow): PendingPost => ({
   meetingId: row.meeting_id, authorId: row.author_id, reason: row.reason, attempts: row.attempts,
   nextAt: row.next_at, state: row.state,
-  ...(row.author_display_name ? { authorDisplayName: row.author_display_name } : {}),
   source: { messageId: row.message_id, channelId: row.channel_id, url: row.source_url },
 });
 
@@ -153,9 +150,6 @@ export class ExtractionStore {
       );
     `);
     this.db.transaction(() => {
-      if (!this.db.query<{ name: string }, []>("PRAGMA table_info(pending_posts)").all().some(c => c.name === "author_display_name")) {
-        this.db.exec("ALTER TABLE pending_posts ADD COLUMN author_display_name TEXT NOT NULL DEFAULT ''");
-      }
       const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(post_review_notifications)").all();
       if (!columns.some(c => c.name === "reviewer_display_name")) {
         this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN reviewer_display_name TEXT NOT NULL DEFAULT ''");
@@ -253,33 +247,31 @@ export class ExtractionStore {
 
   /** 再試行を記録し、回数を 1 増やして次の時刻を決める。返り値は記録後の回数。 */
   scheduleRetry(meetingId: string, authorId: string, source: PostReference, reason: string,
-    delaySeconds: (attempts: number) => number, nowSeconds: number, authorDisplayName = ""): number {
+    delaySeconds: (attempts: number) => number, nowSeconds: number): number {
     return this.db.transaction((): number => {
       const prior = this.db.query<{ attempts: number }, [string]>(
         "SELECT attempts FROM pending_posts WHERE message_id = ?").get(source.messageId);
       const attempts = (prior?.attempts ?? 0) + 1;
       this.db.query(`INSERT INTO pending_posts
-        (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state, author_display_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'retry', ?)
+        (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'retry')
         ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, attempts = excluded.attempts,
-          next_at = excluded.next_at, state = 'retry',
-          author_display_name = CASE WHEN excluded.author_display_name <> '' THEN excluded.author_display_name ELSE pending_posts.author_display_name END`
+          next_at = excluded.next_at, state = 'retry'`
       ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, attempts,
-        nowSeconds + delaySeconds(attempts), authorDisplayName.replace(/[\r\n]/g, " ").slice(0, 100));
+        nowSeconds + delaySeconds(attempts));
       return attempts;
     }).immediate();
   }
 
   /** 取り直せない・回数切れの投稿は消さず、確認対象として残す。 */
   /** 確認対象を本文なしで残す。新しい投稿でも、受信箱から消す前に記録しておく。 */
-  holdReview(meetingId: string, authorId: string, source: PostReference, reason: string, nowSeconds: number, authorDisplayName = ""): void {
+  holdReview(meetingId: string, authorId: string, source: PostReference, reason: string, nowSeconds: number): void {
     this.db.query(`INSERT INTO pending_posts
-      (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state, author_display_name)
-      SELECT ?, ?, ?, ?, ?, ?, 0, ?, 'review', ?
+      (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state)
+      SELECT ?, ?, ?, ?, ?, ?, 0, ?, 'review'
       WHERE NOT EXISTS (SELECT 1 FROM post_review_notifications WHERE message_id = ? AND closed = 1)
-      ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, state = 'review',
-        author_display_name = CASE WHEN excluded.author_display_name <> '' THEN excluded.author_display_name ELSE pending_posts.author_display_name END`
-    ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, nowSeconds, authorDisplayName.replace(/[\r\n]/g, " ").slice(0, 100), source.messageId);
+      ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, state = 'review'`
+    ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, nowSeconds, source.messageId);
   }
 
   markReview(messageId: string, reason: string): void {

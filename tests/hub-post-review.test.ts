@@ -23,6 +23,17 @@ const community: HubCommunity = { id: 1, name: "集会", role: "owner", recordin
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
+function expectNoPendingDisplayName(path: string, displayName: string): void {
+  const db = new Database(path);
+  try {
+    const columns = db.query<{ name: string }, []>("PRAGMA table_info(pending_posts)").all();
+    expect(columns.map(column => column.name)).not.toContain("author_display_name");
+    const rows = db.query("SELECT * FROM pending_posts").all();
+    expect(rows).toHaveLength(1);
+    expect(JSON.stringify(rows)).not.toContain(displayName);
+  } finally { db.close(); }
+}
+
 function fixture(notification: NotificationTarget = { type: "channel", channelId: "11" }) {
   const dir = mkdtempSync(join(tmpdir(), "hub-post-review-"));
   const path = join(dir, "state.sqlite");
@@ -102,7 +113,7 @@ test(`確認待ちを ${target.type} へ一度だけ通知し、再起動後も�
   await Promise.all([f.review.flush(), f.review.flush()]); await f.review.flush();
   expect(f.notices).toHaveLength(2);
   expect(f.notices[0]).toMatchObject({ guildId: "100", target,
-    view: { content: "確認が必要な投稿があります。\nhttps://discord.com/channels/100/10/101\n理由：題名を読み取れません。" } });
+    view: { content: `確認が必要な投稿があります。\n投稿者：<@${userId}>\nhttps://discord.com/channels/100/10/101\n理由：題名を読み取れません。` } });
   expect(f.notices[1]!.view.content).toContain("開催日が決まりません");
   expect(new Set(f.notices.map(n => n.nonce)).size).toBe(2);
   const payload = discordHubView(f.notices[0]!.view);
@@ -198,7 +209,7 @@ test("既存の通知テーブルに送信中の列を追加しても送信済�
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("実際の抽出経路の確認待ちから本文を消し、投稿者・リンク・理由を通知し、本文を保存しない", async () => {
+test("実際の抽出経路の確認待ちは投稿者 ID・リンク・理由を通知し、本文・表示名を保存しない", async () => {
   const f = fixture();
   const content = "本文固有の文字列 @everyone <@123456789012345678>";
   f.settings.save({ ...message("101"), authorId: userId, authorDisplayName: "秘密の表示名", content,
@@ -209,13 +220,15 @@ test("実際の抽出経路の確認待ちから本文を消し、投稿者・�
   expect(f.notices).toHaveLength(1);
   expect(f.settings.messages("10")).toEqual([]);
   expect(f.notices[0]!.view.content).toContain("確信を持って判断できません");
+  expectNoPendingDisplayName(f.path, "秘密の表示名");
   const db = new Database(f.path);
   try {
     const rows = db.query("SELECT * FROM pending_posts").all();
     const notifications = db.query("SELECT * FROM post_review_notifications").all();
     const result = JSON.stringify([f.notices, f.logs, rows, notifications]);
     expect(result).not.toContain(content);
-    expect(f.notices[0]!.view.content.split("\n").slice(0, 2)).toEqual(["確認が必要な投稿があります。", "投稿者：秘密の表示名"]);
+    expect(f.notices[0]!.view.content.split("\n").slice(0, 2)).toEqual(["確認が必要な投稿があります。", `投稿者：<@${userId}>`]);
+    expect(result).not.toContain("秘密の表示名");
     expect(f.logs.join()).not.toContain("秘密の表示名");
     expect(result).not.toContain("@everyone"); expect(result).not.toContain("synthetic");
   } finally { db.close(); }
@@ -590,18 +603,34 @@ test("無視時の保留行削除が失敗したら tombstone の更新もロー
 });
 
 
-test("投稿者の表示名を再起動後も表示し、メンションと Markdown を無効にする", async () => {
+for (const authorId of ["12345678901234567", userId, "1234567890123456789", "12345678901234567890"])
+test(`再起動後も ${authorId.length} 桁の投稿者 ID を参照表示し、メンション通知を無効にする`, async () => {
   const f = fixture();
-  f.extracted.holdReview("1", userId, { messageId: "101", channelId: "10", url: "https://discord.com/channels/100/10/101" },
-    "uncertain", 1000, "**運営** @everyone <@123>\n[表示](https://example.invalid)");
+  f.extracted.holdReview("1", authorId, { messageId: "101", channelId: "10", url: "https://discord.com/channels/100/10/101" },
+    "uncertain", 1000);
   f.reopen(); await f.review.flush();
   const content = f.notices[0]!.view.content;
   expect(content.split("\n")).toEqual([
     "確認が必要な投稿があります。",
-    "投稿者：\\*\\*運営\\*\\* ＠everyone \\<＠123\\> \\[表示\\]\\(https://example.invalid\\)",
+    `投稿者：<@${authorId}>`,
     "https://discord.com/channels/100/10/101", "理由：応募か続報かを確信を持って判断できません。",
   ]);
   expect(discordHubView(f.notices[0]!.view).allowedMentions).toEqual({ parse: [], repliedUser: false });
+  expectNoPendingDisplayName(f.path, "**運営**");
+});
+
+for (const authorId of ["", "20", "1234567890123456", "123456789012345678901", "12345678901234567x",
+  "@everyone", `<@${userId}>`, `${userId}\n`, ` ${userId}`, "１２３４５６７８９０１２３４５６７８"])
+test(`snowflake でない投稿者 ID ${JSON.stringify(authorId)} は投稿者行を省く`, async () => {
+  const f = fixture();
+  f.extracted.holdReview("1", authorId, { messageId: "101", channelId: "10", url: "https://discord.com/channels/100/10/101" },
+    "uncertain", 1000);
+  f.reopen(); await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(f.notices[0]!.view.content.split("\n")).toEqual([
+    "確認が必要な投稿があります。", "https://discord.com/channels/100/10/101",
+    "理由：応募か続報かを確信を持って判断できません。",
+  ]);
 });
 
 for (const target of [{ type: "channel", channelId: "11" }, { type: "dm", userId }] as const)
@@ -665,7 +694,7 @@ test(`無視通知の権限不足 ${JSON.stringify(error)} は再起動後も 6 
   f.setEditError(undefined); f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
 });
 
-test("再試行の記録から元投稿が消えて確認待ちになっても投稿者を表示する", async () => {
+test("再試行に表示名を保存せず、元投稿の削除・再起動後も投稿者 ID を参照表示する", async () => {
   const f = fixture();
   f.settings.save({ ...message("101"), authorId: userId, authorDisplayName: "投稿者", content: "応募の本文",
     sourceUrl: "https://discord.com/channels/100/10/101" });
@@ -673,7 +702,9 @@ test("再試行の記録から元投稿が消えて確認待ちになっても�
   const pipeline = new HubPipeline(f.settings, f.extracted, f.gateway,
     { ask: async () => { throw new Error("Synthetic judge failure"); } }, f.hub, f.review, undefined, () => now);
   await pipeline.run();
-  expect(f.extracted.pending("101")).toMatchObject({ state: "retry", authorDisplayName: "投稿者" });
+  expect(f.extracted.pending("101")).toMatchObject({ state: "retry", authorId: userId });
+  expect(f.extracted.pending("101")).not.toHaveProperty("authorDisplayName");
+  expectNoPendingDisplayName(f.path, "投稿者");
   expect(f.settings.purge(23 * 3600, Math.floor(Date.now() / 1000) + 24 * 3600)).toBe(1);
   expect(f.settings.messages("10")).toEqual([]);
   f.reopen(); now += 300;
@@ -681,12 +712,13 @@ test("再試行の記録から元投稿が消えて確認待ちになっても�
   const restarted = new HubPipeline(f.settings, f.extracted, f.gateway,
     { ask: async () => { throw new Error("Unexpected judge call"); } }, f.hub, f.review, undefined, () => now);
   await restarted.run();
-  expect(f.notices[0]!.view.content).toContain("投稿者：投稿者\n");
+  expect(f.notices[0]!.view.content).toContain(`投稿者：<@${userId}>\n`);
   expect(f.notices[0]!.view.content).toContain("元の投稿を取り直せません");
   expect(JSON.stringify(f.notices)).not.toContain("応募の本文");
+  expectNoPendingDisplayName(f.path, "投稿者");
 });
 
-test("複数集会の確認待ちにも投稿者の表示名を引き継ぐ", async () => {
+test("複数集会の確認待ちも表示名を保存せず、投稿者 ID を参照表示する", async () => {
   const f = fixture();
   f.settings.configure({ guildId: "100", community: { ...community, id: 2 }, channelIds: ["10"],
     notification: { type: "channel", channelId: "11" } }, "100");
@@ -695,6 +727,7 @@ test("複数集会の確認待ちにも投稿者の表示名を引き継ぐ", as
   const pipeline = new HubPipeline(f.settings, f.extracted, f.gateway,
     { ask: async () => { throw new Error("Unexpected judge call"); } }, f.hub, f.review);
   await pipeline.run();
-  expect(f.notices[0]!.view.content).toContain("投稿者：投稿者\n");
+  expect(f.notices[0]!.view.content).toContain(`投稿者：<@${userId}>\n`);
   expect(f.notices[0]!.view.content).toContain("登録先の集会を決められません");
+  expectNoPendingDisplayName(f.path, "投稿者");
 });
