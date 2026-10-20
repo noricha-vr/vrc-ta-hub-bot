@@ -1,3 +1,4 @@
+import { discordText } from "./discord-text";
 import { createHash } from "node:crypto";
 import { HubApiError, type HubDetailFields, type HubReviewApi } from "./hub-api";
 import { HubDeliveryStore, type HubDelivery, type HubReviewDecision } from "./hub-delivery-store";
@@ -10,12 +11,11 @@ import type { NotificationReference } from "./gateway";
 
 export interface HubReviewGateway {
   notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<NotificationReference>;
-  editNotification(reference: NotificationReference, result: string): Promise<void>;
+  editNotification(reference: NotificationReference, result: string, removeLinks?: boolean): Promise<void>;
 }
 const text = (content: string): HubView => ({ content, controls: [] });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const html = (value: string) => value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-const discordText = (value: string) => value.replace(/[\r\n]/g, " ").replace(/@/g, "＠").replace(/[\\[\]()*_~`|>#<>]/g, "\\$&");
 
 /** SQLite を正本に、同じ下書きの送信・更新・レビューを直列化する。 */
 export class HubReview {

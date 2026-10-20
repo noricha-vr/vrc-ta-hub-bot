@@ -234,6 +234,7 @@ test(`${target.type} の直近履歴から自分の nonce または通知ボタ�
   let historyDown = false;
   let dmOpened = 0;
   const channel = {
+    id: target.type === "dm" ? "900" : "11",
     type: target.type === "dm" ? ChannelType.DM : ChannelType.GuildText,
     get guildId() { return guildId; },
     guild: { members: { me: { id: "20" } } },
@@ -249,12 +250,12 @@ test(`${target.type} の直近履歴から自分の nonce または通知ボタ�
     users.push(id);
     return { createDM: async () => { dmOpened++; return channel; } };
   }) as unknown as typeof client.users.fetch;
-  const own = (nonce: string | null, customId?: string) => ({ author: { id: "20" }, nonce,
+  const own = (nonce: string | null, customId?: string) => ({ id: "501", author: { id: "20" }, nonce,
     components: customId ? [{ components: [{ customId }] }] : [] });
   const find = () => gateway.findNotification("100", target, "nonce-1", buttonId);
   try {
-    messages = [own("nonce-1")]; expect(await find()).toBe(true);
-    messages = [own(null, buttonId)]; expect(await find()).toBe(true);
+    messages = [own("nonce-1")]; expect(await find()).toEqual({ channelId: channel.id, messageId: "501" });
+    messages = [own(null, buttonId)]; expect(await find()).toEqual({ channelId: channel.id, messageId: "501" });
     messages = [{ ...own("nonce-1", buttonId), author: { id: "30" } }, own("other", "hub-review:102:ignore")];
     expect(await find()).toBe(false);
     messages = []; expect(await find()).toBe(false);
@@ -323,4 +324,34 @@ test(`通知操作に Discord の表示名と元のメッセージ ID を渡す:
     userDisplayName: member && "displayName" in member ? member.displayName : member?.nick ?? "アカウント表示名",
     notification: { channelId: "11", messageId: "501" },
   });
+});
+
+
+test("確認待ちの無視はリンクを含む全ボタンを外し、編集の再試行でも結果を重ねない", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  const original = "確認が必要な投稿があります。\nhttps://discord.com/channels/100/10/101\n理由：題名を読み取れません。";
+  let content = original;
+  let components = discordHubView({ content, controls: [{ type: "buttons", buttons: [
+    { url: "https://example.invalid/event/apply/1/", label: "Hub で登録する" },
+    { id: "hub-review:101:ignore", label: "無視する" },
+  ] }] }).components;
+  const edits: Record<string, unknown>[] = [];
+  client.channels.fetch = (async () => ({ type: ChannelType.GuildText,
+    messages: { fetch: async () => ({ author: { id: "20" }, content,
+      components: components.map(row => ({ components: row.toJSON().components.map(c => ({ ...c, toJSON: () => c })) })),
+      edit: async (payload: Record<string, unknown>) => {
+        edits.push(payload); content = payload.content as string; components = payload.components as typeof components;
+      } }) },
+  })) as unknown as typeof client.channels.fetch;
+  try {
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（<@123456789012345678>）", true);
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（<@123456789012345678>）", true);
+    expect(content).toBe(`${original}\n無視（<@123456789012345678>）`);
+    for (const edit of edits) {
+      expect(edit.components).toEqual([]);
+      expect(edit.allowedMentions).toEqual({ parse: [], repliedUser: false });
+    }
+  } finally { await gateway.stop(); }
 });
