@@ -281,7 +281,11 @@ export class HubReview {
       const url = httpUrl(m.url);
       return url ? [url.replace(/@/g, "%40").replace(/[<>]/g, c => c === "<" ? "%3C" : "%3E")] : [];
     });
-    const materialLine = materials.length ? `\n資料：${materials[0]}${materials.length > 1 ? ` ほか ${materials.length - 1} 件` : ""}` : "";
+    // 長すぎる URL は通知の上限（2,000 文字）を超えるので出さず、件数だけ書く。
+    const shown = materials.find(url => url.length <= 500);
+    const others = materials.length - (shown ? 1 : 0);
+    const materialLine = !materials.length ? ""
+      : shown ? `\n資料：${shown}${others ? ` ほか ${others} 件` : ""}` : `\n資料：${materials.length} 件（URL が長いため Hub で確認）`;
     return {
       content: `承認待ちの発表があります。\n日付：${eventDateLabel(draft.eventDate)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\nテーマ：${discordText(draft.title).slice(0, 300)}${materialLine}\n${sourceFor(draft, setting.guildId)}`,
       controls: [{ type: "buttons", buttons: [

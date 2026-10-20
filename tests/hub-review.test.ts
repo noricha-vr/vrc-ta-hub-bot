@@ -173,6 +173,23 @@ async function setup(f: ReturnType<typeof fixture>, actor: string) {
   expect(views.at(-1)!.content).toContain("設定を保存しました");
 }
 
+test("長すぎる資料 URL は通知に出さず、件数だけ書いて 2,000 文字に収める", async () => {
+  const long = `https://example.invalid/slides/${"a".repeat(1900)}`;
+  const f = fixture(); f.create(userId, "101", [{ kind: "slides", url: long }]);
+  await f.review.flush();
+  const content = f.notifications[0]!.view.content;
+  expect(content.length).toBeLessThanOrEqual(2000);
+  expect(content).not.toContain(long);
+  expect(content.split("\n")[4]).toBe("資料：1 件（URL が長いため Hub で確認）");
+});
+
+test("長い資料 URL があっても、表示できる URL を先に出す", async () => {
+  const f = fixture();
+  f.create(userId, "101", [{ kind: "slides", url: `https://example.invalid/${"a".repeat(600)}` }, { kind: "slides", url: "https://example.invalid/short" }]);
+  await f.review.flush();
+  expect(f.notifications[0]!.view.content.split("\n")[4]).toBe("資料：https://example.invalid/short ほか 1 件");
+});
+
 test("作成前に記録し pending・出典・X-API-Key で登録し、設定された通知先だけにボタンを送る", async () => {
   const f = fixture(); const draft = f.create();
   f.beforeCreate(() => expect(f.deliveries.get(draft.id)?.state).toBe("creating"));
