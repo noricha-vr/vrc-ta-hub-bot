@@ -34,6 +34,20 @@ function expectNoPendingDisplayName(path: string, displayName: string): void {
   } finally { db.close(); }
 }
 
+function expectNoStoredDisplayName(path: string, displayName: string): void {
+  const db = new Database(path);
+  try {
+    const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    for (const { name } of tables) {
+      const rows = db.query(`SELECT * FROM "${name.replace(/"/g, '""')}"`).all();
+      expect(JSON.stringify(rows)).not.toContain(displayName);
+    }
+    const columns = db.query<{ name: string }, []>("PRAGMA table_info(post_review_notifications)").all();
+    expect(columns.map(column => column.name)).toContain("reviewer_id");
+    expect(columns.map(column => column.name)).not.toContain("reviewer_display_name");
+  } finally { db.close(); }
+}
+
 function fixture(notification: NotificationTarget = { type: "channel", channelId: "11" }) {
   const dir = mkdtempSync(join(tmpdir(), "hub-post-review-"));
   const path = join(dir, "state.sqlite");
@@ -144,7 +158,7 @@ test(`${target.type} への送信成功後、保存前に停止しても履歴�
   expect(f.logs).toContain("hub_post_review_notification_recovered");
   await f.act();
   expect(f.edits).toEqual([{ reference: { channelId: target.type === "dm" ? "900" : "11", messageId: "501" },
-    result: "無視", removeLinks: true }]);
+    result: `無視（<@${userId}>）`, removeLinks: true }]);
 });
 
 test("照合できるまでは再送せず、他の確認待ちを通知できる", async () => {
@@ -201,7 +215,7 @@ test("既存の通知テーブルに送信中の列を追加しても送信済�
   try {
     expect(store.reviewNotification("101")).toMatchObject({ notified: 1, closed: 0, sending: 0, notification: "" });
     expect(store.reviewNotification("101")).toMatchObject({ attempted_at: 0, send_outcome: "sent" });
-    expect(store.reviewNotification("101")).toMatchObject({ reconcile_delay_ms: 0, reconcile_next_at: 0 });
+    expect(store.reviewNotification("101")).toMatchObject({ reconcile_delay_ms: 0, reconcile_next_at: 0, reviewer_id: "" });
     expect(store.reviewNotification("102")).toMatchObject({ notified: 1, closed: 1, sending: 0, notification: "" });
     store.reserveReviewNotification("103", "100", 2, { type: "dm", userId });
     expect(store.reviewNotification("103")).toMatchObject({ community_id: 2, notified: 0, sending: 1,
@@ -634,14 +648,39 @@ test(`snowflake でない投稿者 ID ${JSON.stringify(authorId)} は投稿者�
 });
 
 for (const target of [{ type: "channel", channelId: "11" }, { type: "dm", userId }] as const)
-test(`無視すると ${target.type} の元通知を編集し、全ボタンを外して安全な表示名を足す`, async () => {
+test(`無視すると ${target.type} の元通知を編集し、表示名を保存せず操作した人の ID を参照表示する`, async () => {
   const f = fixture(target); f.hold(); await f.review.flush();
-  expect(await f.act("101", target.type === "dm" ? null : "100", userId,
-    { userDisplayName: "**運営** @everyone\n<@123>" })).toContain("閉じました");
+  const actorId = "987654321098765432";
+  const displayName = "**運営** @everyone\n<@123>";
+  expect(await f.act("101", target.type === "dm" ? null : "100", actorId,
+    { userDisplayName: displayName })).toContain("閉じました");
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ closed: 1, reviewer_id: actorId });
+  expectNoStoredDisplayName(f.path, displayName);
+  expectNoStoredDisplayName(f.path, "運営");
   expect(f.edits).toEqual([{ reference: { channelId: target.type === "dm" ? "900" : "11", messageId: "501" },
-    result: "無視（\\*\\*運営\\*\\* ＠everyone \\<＠123\\>）", removeLinks: true }]);
+    result: `無視（<@${actorId}>）`, removeLinks: true }]);
   expect(f.logs).toContain("hub_post_review_notification_edited");
   f.reopen(); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  expect(f.extracted.reviewNotification("101")?.reviewer_id).toBe(actorId);
+  expectNoStoredDisplayName(f.path, "運営");
+});
+
+for (const actorId of ["12345678901234567", userId, "1234567890123456789", "12345678901234567890"])
+test(`無視した人の ${actorId.length} 桁の ID を参照表示する`, async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  await f.act("101", "100", actorId);
+  expect(f.extracted.reviewNotification("101")?.reviewer_id).toBe(actorId);
+  expect(f.edits[0]?.result).toBe(`無視（<@${actorId}>）`);
+});
+
+for (const actorId of ["", "20", "1234567890123456", "123456789012345678901", "12345678901234567x",
+  "@everyone", `<@${userId}>`, `${userId}\n`, ` ${userId}`, "１２３４５６７８９０１２３４５６７８"])
+test(`snowflake でない操作した人の ID ${JSON.stringify(actorId)} は無視だけを表示する`, async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  expect(f.extracted.closeReview("101", actorId)).toBe(true);
+  f.reopen(); await f.review.flush();
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ closed: 1, reviewer_id: actorId });
+  expect(f.edits[0]?.result).toBe("無視");
 });
 
 test("無視の通知編集に失敗しても閉じた記録を残し、再起動後に間隔を倍増して編集し直す", async () => {
@@ -650,12 +689,14 @@ test("無視の通知編集に失敗しても閉じた記録を残し、再起�
   expect(await f.act("101", "100", userId, { userDisplayName: "運営" })).toContain("閉じました");
   expect(f.extracted.pending("101")).toBeUndefined();
   expect(f.extracted.reviewNotification("101")?.closed).toBe(1);
+  expectNoStoredDisplayName(f.path, "運営");
   expect(f.edits).toHaveLength(1);
   f.reopen(); f.advance(299999); await f.review.flush(); expect(f.edits).toHaveLength(1);
   f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
   f.reopen(); f.setEditError(undefined); f.advance(599999); await f.review.flush(); expect(f.edits).toHaveLength(2);
   f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(3);
-  expect(f.edits[2]?.result).toBe("無視（運営）");
+  expect(f.edits[2]?.result).toBe(`無視（<@${userId}>）`);
+  expectNoStoredDisplayName(f.path, "運営");
   f.advance(21600000); await f.review.flush(); expect(f.edits).toHaveLength(3);
   expect(f.notices).toHaveLength(1);
   expect(f.logs).toContain("hub_post_review_notification_retry");
@@ -680,7 +721,7 @@ test("旧通知に編集先 ID がなくても押された通知から補って�
   f.extracted.reserveReviewNotification("101", "100", 1, { type: "channel", channelId: "11" });
   f.extracted.markReviewNotified("101");
   await f.act("101", "100", userId, { notification: { channelId: "11", messageId: "499" } });
-  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "499" }, result: "無視", removeLinks: true }]);
+  expect(f.edits).toEqual([{ reference: { channelId: "11", messageId: "499" }, result: `無視（<@${userId}>）`, removeLinks: true }]);
 });
 
 

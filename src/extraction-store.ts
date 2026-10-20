@@ -76,7 +76,7 @@ export interface PostReviewNotification {
   send_outcome: "unknown" | "rejected" | "sent";
   reconcile_delay_ms: number;
   reconcile_next_at: number;
-  reviewer_display_name: string;
+  reviewer_id: string;
 }
 
 export interface PostReviewNotificationEdit {
@@ -87,7 +87,7 @@ export interface PostReviewNotificationEdit {
   attempts: number;
   next_at: number;
   closed_reason: string;
-  reviewer_display_name: string;
+  reviewer_id: string;
 }
 
 export interface ReviewNotificationRejections {
@@ -151,8 +151,8 @@ export class ExtractionStore {
     `);
     this.db.transaction(() => {
       const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(post_review_notifications)").all();
-      if (!columns.some(c => c.name === "reviewer_display_name")) {
-        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN reviewer_display_name TEXT NOT NULL DEFAULT ''");
+      if (!columns.some(c => c.name === "reviewer_id")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''");
       }
       if (!columns.some(c => c.name === "sending")) {
         this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN sending INTEGER NOT NULL DEFAULT 0");
@@ -329,7 +329,7 @@ export class ExtractionStore {
 
   /** 無視の記録は消さず、通知の編集だけを独立して再試行する。時刻はミリ秒。 */
   dueReviewNotificationEdits(now: number, messageId?: string): PostReviewNotificationEdit[] {
-    return this.db.query<PostReviewNotificationEdit, [number, string | null, string | null]>(`SELECT e.*, n.reviewer_display_name
+    return this.db.query<PostReviewNotificationEdit, [number, string | null, string | null]>(`SELECT e.*, n.reviewer_id
       FROM post_review_notification_edits e JOIN post_review_notifications n ON n.message_id = e.source_message_id
       WHERE n.closed = 1 AND e.edited = 0 AND e.closed_reason = '' AND e.next_at <= ?
         AND (? IS NULL OR e.source_message_id = ?) ORDER BY e.rowid`).all(now, messageId ?? null, messageId ?? null);
@@ -389,11 +389,11 @@ export class ExtractionStore {
   }
 
   /** 閉じた記録も残し、同じ投稿の再取り込みで通知し直さない。 */
-  closeReview(messageId: string, displayName = ""): boolean {
+  closeReview(messageId: string, reviewerId = ""): boolean {
     return this.db.transaction(() => {
-      const changed = this.db.query(`UPDATE post_review_notifications SET closed = 1, reviewer_display_name = ?,
+      const changed = this.db.query(`UPDATE post_review_notifications SET closed = 1, reviewer_id = ?,
         reconcile_delay_ms = 0, reconcile_next_at = 0 WHERE message_id = ? AND closed = 0`)
-        .run(displayName.replace(/[\r\n]/g, " ").slice(0, 100), messageId).changes > 0;
+        .run(reviewerId, messageId).changes > 0;
       if (changed) this.clearPending(messageId);
       return changed;
     }).immediate();

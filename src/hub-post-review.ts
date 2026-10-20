@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { discordText } from "./discord-text";
 import { notificationTargetUnavailable, type NotificationReference } from "./gateway";
 import type { HubApi } from "./hub-api";
 import type { ExtractionStore, PendingPost } from "./extraction-store";
@@ -78,9 +77,9 @@ export class HubPostReview {
       if (this.editing.has(key)) continue;
       this.editing.add(key);
       try {
-        const name = discordText(pending.reviewer_display_name);
+        const reviewer = /^[0-9]{17,20}$/.test(pending.reviewer_id) ? `（<@${pending.reviewer_id}>）` : "";
         await this.gateway.editNotification({ channelId: pending.channel_id, messageId: pending.message_id },
-          `無視${name ? `（${name}）` : ""}`, true);
+          `無視${reviewer}`, true);
         this.extracted.reviewNotificationEdited(pending);
         this.log("hub_post_review_notification_edited");
       } catch (error) {
@@ -190,7 +189,7 @@ export class HubPostReview {
         await i.edit(text("この確認待ちは処理済みか、設定が変更されています。/hub status で確認してください。")); return;
       }
       if (i.notification) this.extracted.reviewNotificationReference(id, i.notification);
-      if (!this.extracted.closeReview(id, i.userDisplayName)) {
+      if (!this.extracted.closeReview(id, i.userId)) {
         await i.edit(text("この確認待ちは処理済みか、設定が変更されています。/hub status で確認してください。")); return;
       }
       this.log("hub_post_review_ignored");

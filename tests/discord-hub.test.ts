@@ -346,9 +346,9 @@ test("確認待ちの無視はリンクを含む全ボタンを外し、編集�
       } }) },
   })) as unknown as typeof client.channels.fetch;
   try {
-    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（運営）", true);
-    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（運営）", true);
-    expect(content).toBe(`${original}\n無視（運営）`);
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（<@123456789012345678>）", true);
+    await gateway.editNotification({ channelId: "11", messageId: "501" }, "無視（<@123456789012345678>）", true);
+    expect(content).toBe(`${original}\n無視（<@123456789012345678>）`);
     for (const edit of edits) {
       expect(edit.components).toEqual([]);
       expect(edit.allowedMentions).toEqual({ parse: [], repliedUser: false });
