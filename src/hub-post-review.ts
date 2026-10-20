@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { notificationTargetUnavailable } from "./gateway";
 import type { HubApi } from "./hub-api";
 import type { ExtractionStore, PendingPost } from "./extraction-store";
 import type { HubReviewGateway } from "./hub-review";
@@ -6,7 +7,8 @@ import type { HubInteraction, HubView } from "./hub-setup";
 import type { HubSetting, HubStore, NotificationTarget } from "./hub-store";
 
 export interface HubPostReviewGateway extends HubReviewGateway {
-  findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string): Promise<boolean>;
+  findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string,
+    attemptedAt: number): Promise<boolean | "unknown">;
 }
 
 const reasons: Record<string, string> = {
@@ -25,6 +27,10 @@ const reasons: Record<string, string> = {
   hub_create_unconfirmed: "Hub に下書きが登録されたか確認できません。",
 };
 const text = (content: string): HubView => ({ content, controls: [] });
+const targetKey = (target: NotificationTarget) => target.type === "dm" ? `dm:${target.userId}` : `channel:${target.channelId}`;
+// 別宛先への再送を Discord の送信者単位の nonce 重複排除で捨てない。
+const notificationNonce = (id: string, target: NotificationTarget) => createHash("sha256")
+  .update(`post-review:${id}:${targetKey(target)}`).digest("hex").slice(0, 24);
 
 /** 本文を持たない確認待ちを、投稿ごとに一度だけ通知する。 */
 export class HubPostReview {
@@ -55,23 +61,46 @@ export class HubPostReview {
     }).length;
   }
 
+  unknownNotificationCount(): number {
+    return this.extracted.unknownReviewNotificationCount();
+  }
+
   async flush(): Promise<void> {
     for (const post of this.extracted.reviewPosts()) {
       const recorded = this.extracted.reviewNotification(post.source.messageId);
       if (recorded?.notified || recorded?.closed) continue;
       try {
-        const nonce = createHash("sha256").update(`post-review:${post.source.messageId}`).digest("hex").slice(0, 24);
         const buttonId = `hub-review:${post.source.messageId}:ignore`;
-        // 設定が変わっても、送信した可能性のある旧宛先を先に確認する。
-        // 履歴の取得失敗は未送信の証拠にならないため、再送せず次の周期で照合する。
-        if (recorded?.sending && await this.gateway.findNotification(recorded.guild_id,
-          JSON.parse(recorded.notification) as NotificationTarget, nonce, buttonId)) {
-          this.extracted.markReviewNotified(post.source.messageId);
-          this.log("hub_post_review_notification_recovered");
-          continue;
+        let inaccessibleTarget: NotificationTarget | undefined;
+        if (recorded?.sending) {
+          const oldTarget = JSON.parse(recorded.notification) as NotificationTarget;
+          let found: boolean | "unknown";
+          try {
+            // 旧形式の nonce で送信した通知も、変わらないボタン ID で見つかる。
+            found = await this.gateway.findNotification(recorded.guild_id, oldTarget,
+              notificationNonce(post.source.messageId, oldTarget), buttonId, recorded.attempted_at);
+          } catch (error) {
+            // 一時障害は再送の根拠にならない。旧宛先が恒久的に読めない時だけ別宛先を許可する。
+            if (!notificationTargetUnavailable(error)) {
+              this.log("hub_post_review_notification_unknown");
+              throw error;
+            }
+            inaccessibleTarget = oldTarget;
+            found = "unknown";
+          }
+          if (found === true) {
+            this.extracted.markReviewNotified(post.source.messageId);
+            this.log("hub_post_review_notification_recovered");
+            continue;
+          }
+          if (found === "unknown") {
+            this.log("hub_post_review_notification_unknown");
+            if (!inaccessibleTarget) continue;
+          }
         }
         const setting = this.target(post);
         if (!setting) continue;
+        if (inaccessibleTarget && targetKey(inaccessibleTarget) === targetKey(setting.notification)) continue;
         const view: HubView = {
           content: `${post.source.url}\n理由：${reasons[post.reason] ?? "自動で処理できないため確認が必要です。"}`,
           controls: [{ type: "buttons", buttons: [
@@ -80,7 +109,15 @@ export class HubPostReview {
           ] }],
         };
         this.extracted.reserveReviewNotification(post.source.messageId, setting.guildId, setting.community.id, setting.notification);
-        await this.gateway.notify(setting.guildId, setting.notification, view, nonce);
+        try {
+          await this.gateway.notify(setting.guildId, setting.notification, view, notificationNonce(post.source.messageId, setting.notification));
+        } catch (error) {
+          if (notificationTargetUnavailable(error)) {
+            this.extracted.markReviewNotificationRejected(post.source.messageId);
+            this.log("hub_post_review_notification_rejected");
+          } else this.log("hub_post_review_notification_unknown");
+          throw error;
+        }
         this.extracted.markReviewNotified(post.source.messageId);
         this.log("hub_post_review_notified");
       } catch { this.log("hub_post_review_notification_failed"); }

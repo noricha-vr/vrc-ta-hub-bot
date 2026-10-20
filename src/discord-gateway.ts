@@ -15,6 +15,7 @@ export const clientOptions: ClientOptions = {
 };
 
 const GUILD_PAGE = 200;
+const NOTIFICATION_HISTORY_PAGES = 20;
 
 function toMessage(message: Message): GatewayMessage {
   return {
@@ -131,12 +132,13 @@ export class DiscordGateway implements Gateway {
   }
 
   /** SDK のキャッシュや短時間の nonce 重複排除に頼らず、自分の通知を照合する。 */
-  async findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string): Promise<boolean> {
+  async findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string,
+    attemptedAt = 0): Promise<boolean | "unknown"> {
     const channel = target.type === "dm"
       ? await (await this.client.users.fetch(target.userId)).createDM()
       : await this.client.channels.fetch(target.channelId);
     if (!channel || (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
-      throw new Error("Invalid notification channel");
+      throw Object.assign(new Error("Invalid notification channel"), { status: 404 });
     }
     if (target.type === "dm" ? channel.type !== ChannelType.DM : channel.type === ChannelType.DM || channel.guildId !== guildId) {
       throw new Error("Invalid notification channel");
@@ -144,13 +146,24 @@ export class DiscordGateway implements Gateway {
     if (channel.type !== ChannelType.DM) {
       const me = channel.guild.members.me ?? await channel.guild.members.fetchMe();
       if (!channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])) {
-        throw new Error("Notification channel lacks history permissions");
+        throw Object.assign(new Error("Notification channel lacks history permissions"), { status: 403 });
       }
     }
-    const messages = await channel.messages.fetch({ limit: 100, cache: false });
-    return [...messages.values()].some(message => message.author.id === this.client.user?.id
-      && (message.nonce === nonce || message.components.some(row => "components" in row
-        && row.components.some(component => "customId" in component && component.customId === buttonId))));
+    let before: string | undefined;
+    for (let page = 0; page < NOTIFICATION_HISTORY_PAGES; page++) {
+      const messages = [...(await channel.messages.fetch({ limit: 100, cache: false, ...(before ? { before } : {}) })).values()];
+      if (messages.some(message => message.author.id === this.client.user?.id
+        && (message.nonce === nonce || message.components.some(row => "components" in row
+          && row.components.some(component => "customId" in component && component.customId === buttonId))))) return true;
+      // 全履歴を読み切れた場合だけ未送信とする。時間・ページ数の上限は未送信の証拠にしない。
+      if (messages.length < 100) return false;
+      const oldest = messages.reduce((a, b) => BigInt(a.id) < BigInt(b.id) ? a : b);
+      // ホストと Discord の時計の差に 5 秒の余裕を持たせる。旧記録は時刻不明なのでページ数で制限する。
+      if (attemptedAt > 0 && oldest.createdTimestamp < attemptedAt - 5000) return "unknown";
+      if (before && BigInt(oldest.id) >= BigInt(before)) return "unknown";
+      before = oldest.id;
+    }
+    return "unknown";
   }
 
   async validateChannels(guildId: string, channelIds: string[], purpose: "read" | "notify", userId: string): Promise<void> {

@@ -71,6 +71,8 @@ export interface PostReviewNotification {
   closed: number;
   sending: number;
   notification: string;
+  attempted_at: number;
+  send_outcome: "unknown" | "rejected" | "sent";
 }
 
 /** 抽出済みの項目と出典だけを保存する。受信箱とは独立し、本文の列を持たない。 */
@@ -128,6 +130,13 @@ export class ExtractionStore {
       }
       if (!columns.some(c => c.name === "notification")) {
         this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN notification TEXT NOT NULL DEFAULT ''");
+      }
+      if (!columns.some(c => c.name === "attempted_at")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN attempted_at INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columns.some(c => c.name === "send_outcome")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN send_outcome TEXT NOT NULL DEFAULT 'unknown'");
+        this.db.exec("UPDATE post_review_notifications SET send_outcome = 'sent' WHERE notified = 1");
       }
     }).immediate();
   }
@@ -260,16 +269,25 @@ export class ExtractionStore {
 
   /** 外部送信より先に宛先を保存し、成否不明なら次の周期で旧宛先を照合する。 */
   reserveReviewNotification(messageId: string, guildId: string, communityId: number, notification: NotificationTarget): void {
-    this.db.query(`INSERT INTO post_review_notifications (message_id, guild_id, community_id, sending, notification)
-      VALUES (?, ?, ?, 1, ?)
+    this.db.query(`INSERT INTO post_review_notifications (message_id, guild_id, community_id, sending, notification, attempted_at, send_outcome)
+      VALUES (?, ?, ?, 1, ?, ?, 'unknown')
       ON CONFLICT(message_id) DO UPDATE SET guild_id = excluded.guild_id, community_id = excluded.community_id,
-        sending = 1, notification = excluded.notification
+        sending = 1, notification = excluded.notification, attempted_at = excluded.attempted_at, send_outcome = 'unknown'
       WHERE notified = 0 AND closed = 0`)
-      .run(messageId, guildId, communityId, JSON.stringify(notification));
+      .run(messageId, guildId, communityId, JSON.stringify(notification), Date.now());
   }
 
   markReviewNotified(messageId: string): void {
-    this.db.query("UPDATE post_review_notifications SET notified = 1, sending = 0 WHERE message_id = ?").run(messageId);
+    this.db.query("UPDATE post_review_notifications SET notified = 1, sending = 0, send_outcome = 'sent' WHERE message_id = ?").run(messageId);
+  }
+
+  markReviewNotificationRejected(messageId: string): void {
+    this.db.query("UPDATE post_review_notifications SET sending = 0, send_outcome = 'rejected' WHERE message_id = ?").run(messageId);
+  }
+
+  unknownReviewNotificationCount(): number {
+    return this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM post_review_notifications
+      WHERE sending = 1 AND notified = 0 AND closed = 0`).get()!.n;
   }
 
   /** 閉じた記録も残し、同じ投稿の再取り込みで通知し直さない。 */

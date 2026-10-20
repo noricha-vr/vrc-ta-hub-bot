@@ -14,6 +14,7 @@ export interface Health {
   pendingChannelCount: number;
   pendingReviewCount: number;
   pendingPostReviewCount: number;
+  unknownPostReviewNotificationCount: number;
   oldestPendingReviewAgeSeconds: number;
   lastSuccessfulSyncAt: string | null;
   lastErrorAt: string | null;

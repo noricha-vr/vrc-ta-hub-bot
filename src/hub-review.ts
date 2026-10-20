@@ -75,6 +75,9 @@ export class HubReview {
   pendingPostReviews(guildId?: string, communityId?: number): number {
     return this.posts?.count(guildId, communityId) ?? 0;
   }
+  unknownPostReviewNotifications(): number {
+    return this.posts?.unknownNotificationCount() ?? 0;
+  }
   private async lock(id: string): Promise<() => void> {
     const previous = this.busy.get(id);
     let release!: () => void;

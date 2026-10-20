@@ -3,12 +3,14 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ChannelType, Client } from "discord.js";
 import { HubBot } from "../src/bot";
+import { clientOptions, DiscordGateway } from "../src/discord-gateway";
 import { ExtractionStore } from "../src/extraction-store";
 import { HubApi, type HubCommunity } from "../src/hub-api";
 import { HubDeliveryStore } from "../src/hub-delivery-store";
 import { HubPipeline } from "../src/hub-pipeline";
-import { HubPostReview } from "../src/hub-post-review";
+import { HubPostReview, type HubPostReviewGateway } from "../src/hub-post-review";
 import { HubReview } from "../src/hub-review";
 import { HubSetup, type HubInteraction, type HubView } from "../src/hub-setup";
 import { HubStore, type NotificationTarget } from "../src/hub-store";
@@ -45,7 +47,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     if (url.pathname === "/api/v1/event/") return Response.json([]);
     throw new Error("Unexpected fake Hub request");
   });
-  const notifier = { findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
+  const notifier: HubPostReviewGateway = { findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
     lookups.push(target);
     if (failFind) throw new Error("secret response body");
     return notices.some(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
@@ -71,7 +73,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     return views[0]!.content;
   };
   cleanups.push(() => { extracted.close(); deliveries.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups,
+  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups, notifier,
     get extracted() { return extracted; }, get review() { return review; },
     reopen: () => { extracted.close(); extracted = new ExtractionStore(path); review = makeReview(); },
     memberships: (value: HubCommunity[]) => { memberships = value; },
@@ -173,10 +175,11 @@ test("既存の通知テーブルに送信中の列を追加しても送信済�
   const store = new ExtractionStore(path);
   try {
     expect(store.reviewNotification("101")).toMatchObject({ notified: 1, closed: 0, sending: 0, notification: "" });
+    expect(store.reviewNotification("101")).toMatchObject({ attempted_at: 0, send_outcome: "sent" });
     expect(store.reviewNotification("102")).toMatchObject({ notified: 1, closed: 1, sending: 0, notification: "" });
     store.reserveReviewNotification("103", "100", 2, { type: "dm", userId });
     expect(store.reviewNotification("103")).toMatchObject({ community_id: 2, notified: 0, sending: 1,
-      notification: JSON.stringify({ type: "dm", userId }) });
+      notification: JSON.stringify({ type: "dm", userId }), send_outcome: "unknown" });
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -333,4 +336,143 @@ test("確認待ち件数を /hub status と健康状態へ出し、無視後に�
   expect(JSON.parse(readFileSync(join(f.dir, "health.json"), "utf8"))).toMatchObject({ pendingPostReviewCount: 1, pendingReviewCount: 0 });
   await f.act(); expect(await status()).toContain("確認待ちの投稿：0 件"); await bot.stop();
   expect(JSON.parse(readFileSync(join(f.dir, "health.json"), "utf8"))).toMatchObject({ pendingPostReviewCount: 0 });
+});
+
+// REST と接続は使わず、実アダプターの履歴ページングまで通す。
+function notificationHistory(f: ReturnType<typeof fixture>, foundOnPage?: number, attemptedAt?: number) {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  const queries: Array<{ before?: string; limit: number; cache: boolean }> = [];
+  client.channels.fetch = (async () => ({
+    type: ChannelType.GuildText, guildId: "100", guild: { members: { me: { id: "20" } } },
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async (query: typeof queries[number]) => {
+      queries.push(query);
+      const page = queries.length;
+      return new Map(Array.from({ length: 100 }, (_, i) => {
+        const id = String(100000 - (page - 1) * 100 - i);
+        return [id, { id, author: { id: "20" }, nonce: null,
+          createdTimestamp: attemptedAt ?? Date.now() + 60000,
+          components: page === foundOnPage && i === 0
+            ? [{ components: [{ customId: "hub-review:101:ignore" }] }] : [] }];
+      }));
+    } },
+  })) as unknown as typeof client.channels.fetch;
+  f.notifier.findNotification = (...args) => gateway.findNotification(...args);
+  cleanups.push(() => gateway.stop());
+  return queries;
+}
+
+test("送信済み通知が履歴の 2 ページ目にあれば再起動後も再送しない", async () => {
+  const f = fixture(); f.hold();
+  f.extracted.markReviewNotified = () => { throw new Error("保存前の停止"); };
+  const before = Date.now();
+  await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  f.reopen();
+  const queries = notificationHistory(f, 2);
+  await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(queries).toEqual([{ limit: 100, cache: false }, { limit: 100, cache: false, before: "99901" }]);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, sending: 0 });
+  expect(f.extracted.reviewNotification("101")!.attempted_at).toBeGreaterThanOrEqual(before);
+});
+
+test("履歴の 20 ページ上限で見つからない時は再送せず成否不明を健康状態に残す", async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.reopen(); f.failNotify(false);
+  const queries = notificationHistory(f);
+  await f.review.flush();
+  expect(queries).toHaveLength(20);
+  expect(f.notices).toHaveLength(0);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 0, sending: 1, send_outcome: "unknown" });
+  expect(f.logs).toContain("hub_post_review_notification_unknown");
+  const healthPath = join(f.dir, "health.json");
+  const bot = new HubBot(f.gateway, f.settings, { channelIds: [], healthPath, heartbeatMs: 60000,
+    work: { run: async () => {}, review: f.review } });
+  cleanups.push(() => bot.stop());
+  await bot.start("fake");
+  expect(JSON.parse(readFileSync(healthPath, "utf8")).unknownPostReviewNotificationCount).toBe(1);
+});
+
+for (const status of [403, 404])
+test(`送信 API が ${status} で確定拒否された後、削除された旧宛先を照合せず新宛先へ送る`, async () => {
+  const f = fixture(); f.hold();
+  const notify = f.notifier.notify;
+  f.notifier.notify = async () => { throw Object.assign(new Error("private response"), { status }); };
+  await f.review.flush();
+  const rejected = f.extracted.reviewNotification("101");
+  f.reopen(); f.failFind(true); f.notifier.notify = notify;
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "channel", channelId: "12" } }, "100");
+  await f.review.flush();
+  expect(f.lookups).toEqual([]);
+  expect(f.notices).toHaveLength(1);
+  expect(f.notices[0]!.target).toEqual({ type: "channel", channelId: "12" });
+  expect(rejected).toMatchObject({ notified: 0, sending: 0, send_outcome: "rejected" });
+  expect(f.logs).toContain("hub_post_review_notification_rejected");
+});
+
+for (const status of [403, 404])
+test(`成否不明の旧宛先の履歴が ${status} なら、今の設定の別宛先へ送る`, async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.reopen(); f.failNotify(false);
+  f.notifier.findNotification = async () => { throw Object.assign(new Error("private response"), { status }); };
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "channel", channelId: "12" } }, "100");
+  await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(f.notices[0]!.target).toEqual({ type: "channel", channelId: "12" });
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, sending: 0, send_outcome: "sent" });
+  expect(f.logs.join()).not.toContain("private response");
+});
+
+test("送信試行の時刻まで遡ったら再送を保留し、さらに古いページは取得しない", async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.reopen(); f.failNotify(false);
+  const attemptedAt = f.extracted.reviewNotification("101")!.attempted_at;
+  const queries = notificationHistory(f, undefined, attemptedAt - 6000);
+  await f.review.flush();
+  expect(f.notices).toHaveLength(0);
+  expect(queries).toHaveLength(1);
+  expect(f.logs).toContain("hub_post_review_notification_unknown");
+});
+
+for (const status of [403, 404])
+test(`成否不明で履歴が ${status} でも同じ通知先には再送しない`, async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.reopen(); f.failNotify(false);
+  f.notifier.findNotification = async () => { throw Object.assign(new Error("private response"), { status }); };
+  await f.review.flush(); await f.review.flush();
+  expect(f.notices).toHaveLength(0);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 0, sending: 1, send_outcome: "unknown" });
+});
+
+for (const status of [undefined, 500, 503])
+test(`履歴の一時障害 (${status ?? "接続断"}) では通知先の変更後も再送せず照合を待つ`, async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.reopen(); f.failNotify(false);
+  f.notifier.findNotification = async () => { throw Object.assign(new Error("private response"), { status }); };
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "channel", channelId: "12" } }, "100");
+  await f.review.flush();
+  expect(f.notices).toHaveLength(0);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 0, sending: 1, send_outcome: "unknown" });
+  expect(f.logs).toContain("hub_post_review_notification_unknown");
+});
+
+test("旧宛先に届いた成否不明の通知も、別宛先では nonce の重複排除に妨げられず送れる", async () => {
+  const f = fixture(); f.hold();
+  const notify = f.notifier.notify;
+  f.notifier.notify = async (guildId, target, view, nonce) => {
+    // Discord の送信者単位の重複排除を再現する。
+    if (!f.notices.some(n => n.nonce === nonce)) await notify(guildId, target, view, nonce);
+  };
+  f.extracted.markReviewNotified = () => { throw new Error("保存前の停止"); };
+  await f.review.flush(); f.reopen();
+  f.notifier.findNotification = async () => { throw Object.assign(new Error("private response"), { status: 403 }); };
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"], notification: { type: "dm", userId } }, "100");
+  await f.review.flush(); await f.review.flush();
+  expect(f.notices).toHaveLength(2);
+  expect(f.notices[1]!.target).toEqual({ type: "dm", userId });
+  expect(f.notices[0]!.nonce).not.toBe(f.notices[1]!.nonce);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, send_outcome: "sent" });
 });
