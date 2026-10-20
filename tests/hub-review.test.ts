@@ -806,6 +806,159 @@ test("通知は setup で選んだ DM のみ・一時停止中は送信しない
   await f.review.flush(); expect(f.notifications[0]?.target).toEqual({ type: "dm", userId });
 });
 
+const readingChanges = ["pause", "source_removed", "baseline_changed"] as const;
+function changeReading(f: ReturnType<typeof fixture>, change: typeof readingChanges[number]) {
+  if (change === "pause") { f.settings.pause("100", 1); return; }
+  const configure = (channelId: string) => f.settings.configure({ guildId: "100", community,
+    channelIds: [channelId], notification: { type: "channel", channelId: "11" } }, "200");
+  configure("20");
+  if (change === "baseline_changed") configure("10");
+}
+
+for (const change of readingChanges) for (const decision of ["approved", "rejected"] as const) {
+  test(`読み取り設定変更後も登録済みの ${decision} を Hub に送る（${change}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush();
+    changeReading(f, change); f.reopen();
+    expect(f.settings.messageSettings(source.channelId, source.messageId)).toEqual([]);
+    const { i, views } = interaction(draft.id, decision);
+    await f.review.handle({ ...i, userDisplayName: "運営" });
+    expect(f.calls.filter(c => c.path.endsWith("/review/"))).toEqual([
+      { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision, discord_id: userId } },
+    ]);
+    expect(views[0]!.content).toContain(decision === "approved" ? "承認しました" : "却下しました");
+    expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+    expect(f.settings.drafts("100", 1)[0]?.approved).toBe(decision === "approved");
+    expect(f.edits.at(-1)?.result).toBe(`${decision === "approved" ? "承認済み" : "却下"}（運営）`);
+  });
+
+  test(`読み取り設定変更後も保存済みの ${decision} を再送する（${change}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush(); f.setReviewStatus(503);
+    await f.review.handle(interaction(draft.id, decision).i);
+    expect(f.deliveries.decision(draft.id, userId)).toMatchObject({ decision, attempts: 1, next_at: 1300 });
+    changeReading(f, change); f.reopen(); f.setReviewStatus(200);
+    await f.review.flush();
+    expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
+    f.advance(300); await f.review.flush();
+    expect(f.calls.filter(c => c.path.endsWith("/review/"))).toEqual([
+      { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision, discord_id: userId } },
+      { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision, discord_id: userId } },
+    ]);
+    expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+    expect(f.deliveries.decisions(draft.id)).toEqual([]);
+    expect(f.log).toContain(decision === "approved" ? "hub_review_approved" : "hub_review_rejected");
+  });
+
+  test(`読み取り設定変更後も ${decision} の通知編集を再試行する（${change}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush(); f.setEditDown(true);
+    await f.review.handle({ ...interaction(draft.id, decision).i, userDisplayName: "運営" });
+    expect(f.edits).toHaveLength(1); expect(f.deliveries.counts().retry).toBe(1);
+    changeReading(f, change); f.reopen(); f.setEditDown(false);
+    await f.review.flush(); expect(f.edits).toHaveLength(1);
+    f.advance(300); await f.review.flush();
+    expect(f.edits).toEqual(Array(2).fill({ reference: { channelId: "11", messageId: "501" },
+      result: `${decision === "approved" ? "承認済み" : "却下"}（運営）` }));
+    expect(f.deliveries.counts().retry).toBe(0);
+    expect(f.log).toContain("hub_review_notification_edited");
+    f.reopen(); f.advance(); await f.review.flush(); expect(f.edits).toHaveLength(2);
+    expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
+    expect(f.notifications).toHaveLength(1);
+  });
+
+  for (const retry of [false, true]) test(`読み取り設定変更後も確定済みの ${decision} の資料を同期する（${change}, 再試行: ${retry}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush();
+    await f.review.handle(interaction(draft.id, decision).i);
+    if (retry) {
+      f.followUp(draft); f.setPatchDown(true); await f.review.flush();
+      expect(f.deliveries.get(draft.id)).toMatchObject({ attempts: 1, next_at: 1300 });
+    }
+    changeReading(f, change);
+    if (!retry) f.followUp(draft);
+    f.reopen(); f.setPatchDown(false); f.advance(300); await f.review.flush();
+    const patches = f.calls.filter(c => c.method === "PATCH");
+    expect(patches).toHaveLength(retry ? 2 : 1);
+    expect(patches.at(-1)?.body?.additional_info).toContain("102.pdf");
+    expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision, attempts: 0, next_at: 0 });
+    expect(f.log).toContain("hub_draft_updated");
+    await f.review.flush(); expect(f.calls.filter(c => c.method === "PATCH")).toHaveLength(patches.length);
+    expect(f.notifications).toHaveLength(1);
+  });
+}
+
+for (const change of readingChanges) {
+  test(`読み取り設定変更後も未承認の資料を同期し、未登録の下書きは作らない（${change}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush();
+    const unsent = f.create("223456789012345678", "103");
+    f.setEventsDown(true); await f.review.flush();
+    expect(f.deliveries.get(unsent.id)?.state).toBe("queued");
+    changeReading(f, change); f.followUp(draft); f.reopen(); f.setEventsDown(false); f.advance();
+    await f.review.flush();
+    expect(f.calls.filter(c => c.method === "PATCH").at(-1)?.body?.additional_info).toContain("102.pdf");
+    expect(f.deliveries.get(draft.id)?.state).toBe("ready");
+    expect(f.createCount).toBe(1); expect(f.deliveries.get(unsent.id)?.state).toBe("queued");
+  });
+
+  test(`読み取り設定変更後も承認権限は Hub が確認する（${change}）`, async () => {
+    const f = fixture(); const draft = f.create(); await f.review.flush();
+    changeReading(f, change); f.setReviewStatus(403);
+    const { i, views } = interaction(draft.id); await f.review.handle(i);
+    expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1);
+    expect(views[0]!.content).toContain("主催者ではありません");
+    expect(f.deliveries.get(draft.id)?.state).toBe("ready");
+    expect(f.deliveries.decisions(draft.id)).toEqual([]); expect(f.edits).toEqual([]);
+  });
+}
+
+for (const decision of ["approved", "rejected"] as const)
+for (const pending of ["unsynced", "patch_retry", "notification_retry"] as const)
+for (const wholeGuild of [false, true]) test(`同じ集会の再設定後も確定済み配送を再開しない（${decision}, ${pending}, サーバー全体: ${wholeGuild}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditDown(pending === "notification_retry");
+  await f.review.handle(interaction(draft.id, decision).i);
+  if (pending !== "notification_retry") f.followUp(draft);
+  if (pending === "patch_retry") {
+    f.setPatchDown(true); await f.review.flush();
+    expect(f.deliveries.get(draft.id)).toMatchObject({ attempts: 1, next_at: 1300 });
+  }
+  if (pending === "notification_retry") {
+    expect(f.edits).toHaveLength(1);
+    expect(f.deliveries.counts().retry).toBe(1);
+  }
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+  f.settings.leave("100", wholeGuild ? undefined : 1);
+  f.reopen();
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"],
+    notification: { type: "channel", channelId: "11" } }, "200");
+  f.reopen(); f.setPatchDown(false); f.setEditDown(false); f.advance();
+  const before = f.calls.length; const edits = f.edits.length;
+  await f.review.flush();
+  expect(f.calls).toHaveLength(before); expect(f.edits).toHaveLength(edits);
+  const { i, views } = interaction(draft.id, decision); await f.review.handle(i);
+  expect(views[0]!.content).toContain("古くなりました");
+  expect(f.calls).toHaveLength(before); expect(f.edits).toHaveLength(edits);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed" });
+  expect(f.deliveries.counts().retry).toBe(0);
+  expect(f.notifications).toHaveLength(1);
+});
+
+for (const closed of [false, true]) test(`leave 後は判断・再送・資料同期・通知編集をしない（確定済み: ${closed}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  if (closed) f.setEditDown(true); else f.setReviewStatus(503);
+  await f.review.handle(interaction(draft.id).i);
+  f.followUp(draft); f.settings.leave("100", 1);
+  // 同じサーバーの別集会や別サーバーの同じ集会では代用しない。
+  f.settings.configure({ guildId: "100", community: { ...community, id: 2 }, channelIds: ["20"],
+    notification: { type: "channel", channelId: "21" } }, "200");
+  f.settings.configure({ guildId: "200", community, channelIds: ["30"],
+    notification: { type: "channel", channelId: "31" } }, "200");
+  f.reopen(); f.setReviewStatus(200); f.setEditDown(false); f.advance();
+  const before = f.calls.length; const edits = f.edits.length;
+  await f.review.flush();
+  const { i, views } = interaction(draft.id); await f.review.handle(i);
+  expect(views[0]!.content).toContain("古くなりました");
+  expect(f.calls).toHaveLength(before); expect(f.edits).toHaveLength(edits);
+  expect(f.deliveries.decisions(draft.id)).toEqual([]); expect(f.notifications).toHaveLength(1);
+});
+
 test("flush の重なりや二重クリックでも同じ下書きへの送信を直列化する", async () => {
   const f = fixture(); const draft = f.create();
   await Promise.all([f.review.flush(), f.review.flush()]); expect(f.createCount).toBe(1);

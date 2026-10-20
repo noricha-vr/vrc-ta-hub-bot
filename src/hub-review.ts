@@ -36,6 +36,9 @@ export class HubReview {
   private setting(row: HubDelivery): HubSetting | undefined {
     const draft = this.extracted.get(row.draft_id);
     if (draft?.meetingId !== String(row.community_id)) return;
+    if (row.state === "closed" && row.reason === "setting_removed") return;
+    // 登録済みの審査・同期は読み取り対象や導入境界から切り離す。
+    if (row.hub_id) return this.settings.settings(row.guild_id).find(s => s.community.id === row.community_id);
     return this.draftTarget(draft, row.guild_id)?.setting;
   }
 
@@ -53,9 +56,11 @@ export class HubReview {
   private enqueue(): string[] {
     const changed: string[] = [];
     for (const draft of this.extracted.allDrafts()) {
-      const setting = this.draftTarget(draft)?.setting;
-      if (!setting) continue;
       const previous = this.deliveries.get(draft.id);
+      // leave 後の復帰と新規作成には、今の読み取り対象に含まれる出典が必要。
+      const setting = previous?.hub_id && !(previous.state === "closed" && previous.reason === "setting_removed")
+        ? this.setting(previous) : this.draftTarget(draft)?.setting;
+      if (!setting) continue;
       this.deliveries.enqueue(draft.id, setting.guildId, setting.community.id);
       if (previous?.state === "closed" && ["approved", "rejected"].includes(previous.reason)
         && previous.synced_hash !== fingerprint(draft)) changed.push(draft.id);

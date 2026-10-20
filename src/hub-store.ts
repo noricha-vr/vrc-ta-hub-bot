@@ -154,7 +154,7 @@ export class HubStore extends MessageStore {
           SELECT draft_id FROM hub_deliveries WHERE guild_id = ? AND (? IS NULL OR community_id = ?)
         )`).run(guildId, communityId ?? null, communityId ?? null);
         this.db.query(`UPDATE hub_deliveries SET state = 'closed', reason = 'setting_removed', decision = NULL, discord_id = NULL
-          WHERE state <> 'closed' AND guild_id = ? AND (? IS NULL OR community_id = ?)`)
+          WHERE guild_id = ? AND (? IS NULL OR community_id = ?)`)
           .run(guildId, communityId ?? null, communityId ?? null);
       }
       for (const setting of settings) {
