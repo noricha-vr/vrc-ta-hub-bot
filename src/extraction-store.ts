@@ -73,6 +73,13 @@ export interface PostReviewNotification {
   notification: string;
   attempted_at: number;
   send_outcome: "unknown" | "rejected" | "sent";
+  reconcile_delay_ms: number;
+  reconcile_next_at: number;
+}
+
+export interface ReviewNotificationRejections {
+  count: number;
+  targets: NotificationTarget[];
 }
 
 /** 抽出済みの項目と出典だけを保存する。受信箱とは独立し、本文の列を持たない。 */
@@ -137,6 +144,12 @@ export class ExtractionStore {
       if (!columns.some(c => c.name === "send_outcome")) {
         this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN send_outcome TEXT NOT NULL DEFAULT 'unknown'");
         this.db.exec("UPDATE post_review_notifications SET send_outcome = 'sent' WHERE notified = 1");
+      }
+      if (!columns.some(c => c.name === "reconcile_delay_ms")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN reconcile_delay_ms INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columns.some(c => c.name === "reconcile_next_at")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN reconcile_next_at INTEGER NOT NULL DEFAULT 0");
       }
     }).immediate();
   }
@@ -233,9 +246,10 @@ export class ExtractionStore {
   holdReview(meetingId: string, authorId: string, source: PostReference, reason: string, nowSeconds: number): void {
     this.db.query(`INSERT INTO pending_posts
       (message_id, channel_id, source_url, meeting_id, author_id, reason, attempts, next_at, state)
-      VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'review')
+      SELECT ?, ?, ?, ?, ?, ?, 0, ?, 'review'
+      WHERE NOT EXISTS (SELECT 1 FROM post_review_notifications WHERE message_id = ? AND closed = 1)
       ON CONFLICT(message_id) DO UPDATE SET reason = excluded.reason, state = 'review'`
-    ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, nowSeconds);
+    ).run(source.messageId, source.channelId, source.url, meetingId, authorId, reason, nowSeconds, source.messageId);
   }
 
   markReview(messageId: string, reason: string): void {
@@ -272,17 +286,41 @@ export class ExtractionStore {
     this.db.query(`INSERT INTO post_review_notifications (message_id, guild_id, community_id, sending, notification, attempted_at, send_outcome)
       VALUES (?, ?, ?, 1, ?, ?, 'unknown')
       ON CONFLICT(message_id) DO UPDATE SET guild_id = excluded.guild_id, community_id = excluded.community_id,
-        sending = 1, notification = excluded.notification, attempted_at = excluded.attempted_at, send_outcome = 'unknown'
+        sending = 1, notification = excluded.notification, attempted_at = excluded.attempted_at, send_outcome = 'unknown',
+        reconcile_delay_ms = 0, reconcile_next_at = 0
       WHERE notified = 0 AND closed = 0`)
       .run(messageId, guildId, communityId, JSON.stringify(notification), Date.now());
   }
 
   markReviewNotified(messageId: string): void {
-    this.db.query("UPDATE post_review_notifications SET notified = 1, sending = 0, send_outcome = 'sent' WHERE message_id = ?").run(messageId);
+    this.db.query(`UPDATE post_review_notifications SET notified = 1, sending = 0, send_outcome = 'sent',
+      reconcile_delay_ms = 0, reconcile_next_at = 0 WHERE message_id = ?`).run(messageId);
   }
 
   markReviewNotificationRejected(messageId: string): void {
-    this.db.query("UPDATE post_review_notifications SET sending = 0, send_outcome = 'rejected' WHERE message_id = ?").run(messageId);
+    this.db.query(`UPDATE post_review_notifications SET sending = 0, send_outcome = 'rejected',
+      reconcile_delay_ms = 0, reconcile_next_at = 0 WHERE message_id = ?`).run(messageId);
+  }
+
+  /** 照合が不明なら 1 分から倍増し、再起動後も最大 1 時間まで待つ。時刻はミリ秒。 */
+  deferReviewNotification(messageId: string, now: number): void {
+    this.db.query(`UPDATE post_review_notifications
+      SET reconcile_delay_ms = min(3600000, max(60000, reconcile_delay_ms * 2)),
+        reconcile_next_at = ? + min(3600000, max(60000, reconcile_delay_ms * 2))
+      WHERE message_id = ? AND sending = 1 AND notified = 0 AND closed = 0`).run(now, messageId);
+  }
+
+  clearReviewNotificationDelay(messageId: string): void {
+    this.db.query(`UPDATE post_review_notifications SET reconcile_delay_ms = 0, reconcile_next_at = 0
+      WHERE message_id = ?`).run(messageId);
+  }
+
+  rejectedReviewNotifications(): ReviewNotificationRejections {
+    const rows = this.db.query<{ notification: string; n: number }, []>(`SELECT notification, count(*) AS n
+      FROM post_review_notifications WHERE send_outcome = 'rejected' AND notified = 0 AND closed = 0
+      GROUP BY notification ORDER BY notification`).all();
+    return { count: rows.reduce((sum, row) => sum + row.n, 0),
+      targets: rows.map(row => JSON.parse(row.notification) as NotificationTarget) };
   }
 
   unknownReviewNotificationCount(): number {
@@ -292,8 +330,12 @@ export class ExtractionStore {
 
   /** 閉じた記録も残し、同じ投稿の再取り込みで通知し直さない。 */
   closeReview(messageId: string): boolean {
-    return this.db.query("UPDATE post_review_notifications SET closed = 1 WHERE message_id = ? AND closed = 0")
-      .run(messageId).changes > 0;
+    return this.db.transaction(() => {
+      const changed = this.db.query(`UPDATE post_review_notifications SET closed = 1,
+        reconcile_delay_ms = 0, reconcile_next_at = 0 WHERE message_id = ? AND closed = 0`).run(messageId).changes > 0;
+      if (changed) this.clearPending(messageId);
+      return changed;
+    }).immediate();
   }
 
   /** 同じ発表者の投稿で、まだ再試行待ちのもの（応募の可能性がある）。応募待ちの続報同士は数えない。 */

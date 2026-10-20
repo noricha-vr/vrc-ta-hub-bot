@@ -78,6 +78,9 @@ export class HubReview {
   unknownPostReviewNotifications(): number {
     return this.posts?.unknownNotificationCount() ?? 0;
   }
+  rejectedPostReviewNotifications() {
+    return this.posts?.rejectedNotifications() ?? { count: 0, targets: [] };
+  }
   private async lock(id: string): Promise<() => void> {
     const previous = this.busy.get(id);
     let release!: () => void;

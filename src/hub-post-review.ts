@@ -40,6 +40,7 @@ export class HubPostReview {
     private readonly extracted: ExtractionStore,
     private readonly hub: Pick<HubApi, "communities" | "registrationUrl">,
     private readonly log: (event: string) => void = () => {},
+    private readonly now: () => number = Date.now,
   ) {}
 
   private target(post: PendingPost): HubSetting | undefined {
@@ -65,10 +66,15 @@ export class HubPostReview {
     return this.extracted.unknownReviewNotificationCount();
   }
 
+  rejectedNotifications() {
+    return this.extracted.rejectedReviewNotifications();
+  }
+
   async flush(): Promise<void> {
     for (const post of this.extracted.reviewPosts()) {
       const recorded = this.extracted.reviewNotification(post.source.messageId);
       if (recorded?.notified || recorded?.closed) continue;
+      if (recorded && recorded.reconcile_next_at > this.now()) continue;
       try {
         const buttonId = `hub-review:${post.source.messageId}:ignore`;
         let inaccessibleTarget: NotificationTarget | undefined;
@@ -82,6 +88,7 @@ export class HubPostReview {
           } catch (error) {
             // 一時障害は再送の根拠にならない。旧宛先が恒久的に読めない時だけ別宛先を許可する。
             if (!notificationTargetUnavailable(error)) {
+              this.extracted.deferReviewNotification(post.source.messageId, this.now());
               this.log("hub_post_review_notification_unknown");
               throw error;
             }
@@ -95,12 +102,17 @@ export class HubPostReview {
           }
           if (found === "unknown") {
             this.log("hub_post_review_notification_unknown");
+            this.extracted.deferReviewNotification(post.source.messageId, this.now());
             if (!inaccessibleTarget) continue;
-          }
+          } else this.extracted.clearReviewNotificationDelay(post.source.messageId);
         }
         const setting = this.target(post);
         if (!setting) continue;
-        if (inaccessibleTarget && targetKey(inaccessibleTarget) === targetKey(setting.notification)) continue;
+        if (inaccessibleTarget && targetKey(inaccessibleTarget) === targetKey(setting.notification)) {
+          continue;
+        }
+        if (recorded?.send_outcome === "rejected"
+          && targetKey(JSON.parse(recorded.notification) as NotificationTarget) === targetKey(setting.notification)) continue;
         const view: HubView = {
           content: `${post.source.url}\n理由：${reasons[post.reason] ?? "自動で処理できないため確認が必要です。"}`,
           controls: [{ type: "buttons", buttons: [

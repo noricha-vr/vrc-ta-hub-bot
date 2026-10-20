@@ -27,6 +27,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   const path = join(dir, "state.sqlite");
   const settings = new HubStore(path);
   let extracted = new ExtractionStore(path);
+  let now = Date.now();
   const deliveries = new HubDeliveryStore(path);
   const gateway = new FakeGateway();
   const notices: Array<{ guildId: string; target: NotificationTarget; view: HubView; nonce: string }> = [];
@@ -58,7 +59,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   } };
   const log = (event: string) => logs.push(event);
   const makeReview = () => new HubReview(notifier, settings, extracted, deliveries, hub, log, () => 1000,
-    new HubPostReview(notifier, settings, extracted, hub, log));
+    new HubPostReview(notifier, settings, extracted, hub, log, () => now));
   let review = makeReview();
   settings.configure({ guildId: "100", community, channelIds: ["10"], notification }, "100");
   const hold = (reason = "title_unextracted", id = "101", meetingId = "1", url = `https://discord.com/channels/100/10/${id}`) => {
@@ -76,6 +77,7 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups, notifier,
     get extracted() { return extracted; }, get review() { return review; },
     reopen: () => { extracted.close(); extracted = new ExtractionStore(path); review = makeReview(); },
+    advance: (ms: number) => { now += ms; },
     memberships: (value: HubCommunity[]) => { memberships = value; },
     failLookup: (value: boolean) => { failLookup = value; },
     failNotify: (value: boolean) => { failNotify = value; },
@@ -129,7 +131,7 @@ test("照合できるまでは再送せず、他の確認待ちを通知でき�
   expect(f.notices).toHaveLength(1);
   expect(f.notices[0]!.view.content).toContain("/102");
   expect(f.extracted.reviewNotification("101")).toMatchObject({ sending: 1, notified: 0 });
-  f.failFind(false); await f.review.flush();
+  f.failFind(false); f.advance(60000); await f.review.flush();
   expect(f.notices).toHaveLength(2);
   expect(f.extracted.reviewNotification("101")).toMatchObject({ sending: 0, notified: 1 });
   expect(f.logs.join()).not.toContain("secret");
@@ -176,6 +178,7 @@ test("既存の通知テーブルに送信中の列を追加しても送信済�
   try {
     expect(store.reviewNotification("101")).toMatchObject({ notified: 1, closed: 0, sending: 0, notification: "" });
     expect(store.reviewNotification("101")).toMatchObject({ attempted_at: 0, send_outcome: "sent" });
+    expect(store.reviewNotification("101")).toMatchObject({ reconcile_delay_ms: 0, reconcile_next_at: 0 });
     expect(store.reviewNotification("102")).toMatchObject({ notified: 1, closed: 1, sending: 0, notification: "" });
     store.reserveReviewNotification("103", "100", 2, { type: "dm", userId });
     expect(store.reviewNotification("103")).toMatchObject({ community_id: 2, notified: 0, sending: 1,
@@ -475,4 +478,96 @@ test("旧宛先に届いた成否不明の通知も、別宛先では nonce の�
   expect(f.notices[1]!.target).toEqual({ type: "dm", userId });
   expect(f.notices[0]!.nonce).not.toBe(f.notices[1]!.nonce);
   expect(f.extracted.reviewNotification("101")).toMatchObject({ notified: 1, send_outcome: "sent" });
+});
+
+test("成否不明の照合は再起動後も 1 分から倍増し、最大 1 時間まで待つ", async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.failNotify(false);
+  let calls = 0;
+  f.notifier.findNotification = async () => { calls++; return "unknown"; };
+  for (const minutes of [1, 2, 4, 8, 16, 32, 60, 60]) {
+    await f.review.flush();
+    const before = calls;
+    expect(f.extracted.reviewNotification("101")!.reconcile_delay_ms).toBe(minutes * 60000);
+    f.reopen();
+    // 通知先が変わっても、待機中には照合も送信もしない。
+    f.settings.configure({ guildId: "100", community, channelIds: ["10"],
+      notification: { type: "channel", channelId: "12" } }, "100");
+    for (let elapsed = 5000; elapsed < minutes * 60000; elapsed += 5000) {
+      f.advance(5000); await f.review.flush();
+      expect(calls).toBe(before); expect(f.notices).toHaveLength(0);
+    }
+    f.advance(4999); await f.review.flush(); expect(calls).toBe(before);
+    f.advance(1);
+  }
+  await f.review.flush(); expect(calls).toBe(9);
+});
+
+for (const found of [true, false])
+test(`成否不明の照合が ${found} になれば待機間隔を消す`, async () => {
+  const f = fixture(); f.hold(); f.failNotify(true);
+  await f.review.flush(); f.failNotify(false);
+  let calls = 0;
+  f.notifier.findNotification = async () => { calls++; return "unknown"; };
+  await f.review.flush();
+  f.notifier.findNotification = async () => { calls++; return found; };
+  await f.review.flush(); expect(calls).toBe(1);
+  f.advance(60000); await f.review.flush();
+  expect(calls).toBe(2);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ reconcile_delay_ms: 0, reconcile_next_at: 0, notified: 1 });
+  expect(f.notices).toHaveLength(found ? 0 : 1);
+});
+
+for (const status of [403, 404]) for (const target of [
+  { type: "channel", channelId: "11" }, { type: "dm", userId },
+] as const)
+test(`${target.type} の ${status} 拒否後は同じ宛先を再送せず、再起動後に宛先変更で送る`, async () => {
+  const f = fixture(target); f.hold(); f.hold("uncertain", "102");
+  const notify = f.notifier.notify;
+  let attempts = 0;
+  f.notifier.notify = async () => { attempts++; throw Object.assign(new Error("private response"), { status }); };
+  await f.review.flush(); expect(attempts).toBe(2);
+  f.reopen(); await f.review.flush(); f.advance(3600000); await f.review.flush();
+  expect(attempts).toBe(2); expect(f.lookups).toEqual([]);
+  const healthPath = join(f.dir, "health.json");
+  const bot = new HubBot(f.gateway, f.settings, { channelIds: [], healthPath, heartbeatMs: 60000,
+    work: { run: async () => {}, review: f.review } });
+  cleanups.push(() => bot.stop()); await bot.start("fake");
+  expect(JSON.parse(readFileSync(healthPath, "utf8"))).toMatchObject({
+    rejectedPostReviewNotificationCount: 2, rejectedPostReviewNotificationTargets: [target],
+  });
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"],
+    notification: { type: "channel", channelId: "12" } }, "100");
+  f.notifier.notify = notify; await f.review.flush(); await bot.stop();
+  expect(f.notices).toHaveLength(2);
+  expect(f.notices.every(n => n.target.type === "channel" && n.target.channelId === "12")).toBe(true);
+  expect(JSON.parse(readFileSync(healthPath, "utf8"))).toMatchObject({
+    rejectedPostReviewNotificationCount: 0, rejectedPostReviewNotificationTargets: [],
+  });
+  expect(f.logs).toContain("hub_post_review_notification_rejected");
+  expect(f.logs.join()).not.toContain("private response");
+});
+
+test("無視すると保留行を消し、tombstone によって再取り込みでも保留・通知を復活させない", async () => {
+  const f = fixture(); f.hold(); await f.review.flush(); await f.act();
+  expect(f.extracted.pending("101")).toBeUndefined();
+  expect(f.extracted.reviewPosts()).toEqual([]);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ closed: 1, notified: 1 });
+  f.reopen(); f.hold(); await f.review.flush();
+  expect(f.extracted.pending("101")).toBeUndefined(); expect(f.notices).toHaveLength(1);
+});
+
+test("無視時の保留行削除が失敗したら tombstone の更新もロールバックする", async () => {
+  const f = fixture(); f.hold(); await f.review.flush();
+  const db = new Database(f.path);
+  try {
+    db.exec(`CREATE TRIGGER reject_pending_delete BEFORE DELETE ON pending_posts
+      BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END`);
+    expect(await f.act()).toContain("確認できません");
+    expect(f.extracted.pending("101")?.state).toBe("review");
+    expect(f.extracted.reviewNotification("101")?.closed).toBe(0);
+    db.exec("DROP TRIGGER reject_pending_delete");
+    expect(await f.act()).toContain("閉じました");
+    expect(f.extracted.pending("101")).toBeUndefined();
+  } finally { db.close(); }
 });
