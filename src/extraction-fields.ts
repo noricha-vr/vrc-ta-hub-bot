@@ -74,7 +74,7 @@ export function validEventDate(date: string): boolean {
 }
 
 /**
- * 日付は日本時間の投稿日を基準に、 Hub から渡された開催日だけに解決する。
+ * 日付は日本時間の投稿日を基準に、Hub から渡された開催日だけに解決する。
  * 応募は投稿日以降の開催日に限る。続報（includePast）は過去の開催日とも照合する。「次回」は常に投稿日以降。
  */
 export function resolveEventDate(

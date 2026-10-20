@@ -87,7 +87,7 @@ export class HubSetup {
     const communities = (await this.hub.communities(i.userId)).filter(c => c.role === "owner" || c.role === "staff");
     if (this.leaving.has(guildId) || revision !== this.revision(guildId)) { await i.edit(text("設定が変更されました。やり直してください。")); return; }
     const available = i.action === "setup" ? communities : communities.filter(c => this.store.settings(guildId).some(s => s.community.id === c.id));
-    if (!available.length) { await i.edit(text("操作できる主催・スタッフの集会がありません。 Hub の登録と設定を確認してください。")); return; }
+    if (!available.length) { await i.edit(text("操作できる主催・スタッフの集会がありません。Hub の登録と設定を確認してください。")); return; }
     // One live wizard per person and guild. Expired menus can never overwrite new choices.
     for (const [token, session] of this.sessions) if (session.userId === i.userId && session.guildId === guildId) this.sessions.delete(token);
     if (this.sessions.size >= 500) { await i.edit(text("設定が混み合っています。しばらく待ってやり直してください。")); return; }
