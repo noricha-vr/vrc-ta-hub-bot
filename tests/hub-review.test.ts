@@ -908,6 +908,38 @@ for (const change of readingChanges) {
   });
 }
 
+for (const decision of ["approved", "rejected"] as const)
+for (const pending of ["unsynced", "patch_retry", "notification_retry"] as const)
+for (const wholeGuild of [false, true]) test(`同じ集会の再設定後も確定済み配送を再開しない（${decision}, ${pending}, サーバー全体: ${wholeGuild}）`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditDown(pending === "notification_retry");
+  await f.review.handle(interaction(draft.id, decision).i);
+  if (pending !== "notification_retry") f.followUp(draft);
+  if (pending === "patch_retry") {
+    f.setPatchDown(true); await f.review.flush();
+    expect(f.deliveries.get(draft.id)).toMatchObject({ attempts: 1, next_at: 1300 });
+  }
+  if (pending === "notification_retry") {
+    expect(f.edits).toHaveLength(1);
+    expect(f.deliveries.counts().retry).toBe(1);
+  }
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: decision });
+  f.settings.leave("100", wholeGuild ? undefined : 1);
+  f.reopen();
+  f.settings.configure({ guildId: "100", community, channelIds: ["10"],
+    notification: { type: "channel", channelId: "11" } }, "200");
+  f.reopen(); f.setPatchDown(false); f.setEditDown(false); f.advance();
+  const before = f.calls.length; const edits = f.edits.length;
+  await f.review.flush();
+  expect(f.calls).toHaveLength(before); expect(f.edits).toHaveLength(edits);
+  const { i, views } = interaction(draft.id, decision); await f.review.handle(i);
+  expect(views[0]!.content).toContain("古くなりました");
+  expect(f.calls).toHaveLength(before); expect(f.edits).toHaveLength(edits);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "setting_removed" });
+  expect(f.deliveries.counts().retry).toBe(0);
+  expect(f.notifications).toHaveLength(1);
+});
+
 for (const closed of [false, true]) test(`leave 後は判断・再送・資料同期・通知編集をしない（確定済み: ${closed}）`, async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   if (closed) f.setEditDown(true); else f.setReviewStatus(503);
