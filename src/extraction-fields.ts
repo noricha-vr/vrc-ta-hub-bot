@@ -54,6 +54,15 @@ const quotedTitle = (text: string, pattern = QUOTED): string | undefined => {
   return match?.slice(1).find(group => group !== undefined)?.trim();
 };
 
+/** 題名を明示した行だけを見る。『題名』のスライドです、などの続報の引用は除く。 */
+export function hasTitleLine(content: string): boolean {
+  return content.split(/\r?\n/).some(line => {
+    const text = line.trim().replace(/。$/, "").trim();
+    return QUOTED.test(text) || LABELLED.test(text) || EMBEDDED_LABEL.test(text)
+      || /(?:題名|タイトル|演題|title)\s*[「『"“]/i.test(text);
+  });
+}
+
 /**
  * 選ばれた行から題名だけを切り出す。次の規則に一致しなければ undefined（review）。
  * (a)「X」『X』"X"“X” (b) ラベル＋区切り＋X（X に句点・終止符・引用符なし） (c) ラベル＋区切り＋引用。
