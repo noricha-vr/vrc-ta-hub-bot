@@ -39,6 +39,8 @@ bun start
 常駐は launchd などのクリーンな環境で起動し、作業ディレクトリと必要な `BOT_ENV_FILE` を明示してください。
 対話シェルの別環境向け設定を引き継がないようにします。
 
+以前の版で `.env` を使っていた場合は、`.env.local` に名前を変えるか、`BOT_ENV_FILE=.env` を指定して起動してください（どちらもしないと、設定ファイルが読めないので起動を止めます）。
+
 このコマンドは実際に Discord へ接続します。開発時に接続は不要です。Bot には対象チャンネルの
 View Channel と Read Message History が必要です。Developer Portal で Message Content Intent を有効にします。
 Gateway の intent は Guilds / GuildMessages / MessageContent のみです。
