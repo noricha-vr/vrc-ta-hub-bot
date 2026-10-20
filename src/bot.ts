@@ -17,6 +17,8 @@ interface BotOptions {
     pendingReviews?(): HubReviewStats;
   } };
   healthPath: string;
+  envFilePath?: string;
+  hubHost?: string;
   heartbeatMs?: number;
   now?: () => Date;
   log?: (event: string) => void;
@@ -46,6 +48,7 @@ export class HubBot {
     this.now = options.now ?? (() => new Date());
     const startedAt = this.now().toISOString();
     this.health = {
+      envFilePath: options.envFilePath ?? null, hubHost: options.hubHost ?? null,
       startedAt, updatedAt: startedAt, lastReceivedAt: null,
       connectionState: "connecting", reconnectCount: 0, recoveredMessageCount: 0,
       pendingChannelCount: this.pending.size, lastSuccessfulSyncAt: null, lastErrorAt: null,

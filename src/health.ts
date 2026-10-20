@@ -3,6 +3,8 @@ import { renameSync, writeFileSync } from "node:fs";
 export type ConnectionState = "connecting" | "connected" | "disconnected" | "reconnecting" | "error" | "stopped";
 
 export interface Health {
+  envFilePath: string | null;
+  hubHost: string | null;
   startedAt: string;
   updatedAt: string;
   lastReceivedAt: string | null;
