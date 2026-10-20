@@ -32,6 +32,9 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
   let memberships: HubCommunity[] = [community];
   let failLookup = false;
   let failNotify = false;
+  let beforeNotify: ((nonce: string) => void) | undefined;
+  let failFind = false;
+  const lookups: NotificationTarget[] = [];
   let beforeLookup: (() => Promise<void>) | undefined;
   const hub = new HubApi("https://example.invalid", "synthetic", async url => {
     if (url.pathname === "/api/v1/community-by-discord/") {
@@ -42,7 +45,12 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     if (url.pathname === "/api/v1/event/") return Response.json([]);
     throw new Error("Unexpected fake Hub request");
   });
-  const notifier = { notify: async (guildId: string, target: NotificationTarget, view: HubView, nonce: string) => {
+  const notifier = { findNotification: async (guildId: string, target: NotificationTarget, nonce: string) => {
+    lookups.push(target);
+    if (failFind) throw new Error("secret response body");
+    return notices.some(n => n.guildId === guildId && JSON.stringify(n.target) === JSON.stringify(target) && n.nonce === nonce);
+  }, notify: async (guildId: string, target: NotificationTarget, view: HubView, nonce: string) => {
+    beforeNotify?.(nonce);
     if (failNotify) throw new Error("secret response body");
     notices.push({ guildId, target, view, nonce });
   } };
@@ -63,12 +71,14 @@ function fixture(notification: NotificationTarget = { type: "channel", channelId
     return views[0]!.content;
   };
   cleanups.push(() => { extracted.close(); deliveries.close(); settings.close(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act,
+  return { dir, path, settings, deliveries, gateway, hub, notices, logs, hold, act, lookups,
     get extracted() { return extracted; }, get review() { return review; },
     reopen: () => { extracted.close(); extracted = new ExtractionStore(path); review = makeReview(); },
     memberships: (value: HubCommunity[]) => { memberships = value; },
     failLookup: (value: boolean) => { failLookup = value; },
     failNotify: (value: boolean) => { failNotify = value; },
+    failFind: (value: boolean) => { failFind = value; },
+    beforeNotify: (value: (nonce: string) => void) => { beforeNotify = value; },
     beforeLookup: (value: () => Promise<void>) => { beforeLookup = value; },
   };
 }
@@ -90,6 +100,84 @@ test(`確認待ちを ${target.type} へ一度だけ通知し、再起動後も�
   ]);
   f.reopen(); await f.review.flush(); expect(f.notices).toHaveLength(2);
   expect(f.review.pendingPostReviews()).toBe(2);
+});
+
+for (const target of [{ type: "channel", channelId: "11" }, { type: "dm", userId }] as const)
+test(`${target.type} への送信成功後、保存前に停止しても履歴を照合して再送しない`, async () => {
+  const f = fixture(target); f.hold();
+  f.beforeNotify(() => {
+    expect(f.extracted.reviewNotification("101")).toMatchObject({ sending: 1, notified: 0,
+      notification: JSON.stringify(target) });
+  });
+  f.extracted.markReviewNotified = () => { throw new Error("停止を再現"); };
+  await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(f.extracted.reviewNotification("101")?.notified).toBe(0);
+  f.reopen(); await f.review.flush(); await f.review.flush();
+  expect(f.lookups).toEqual([target]);
+  expect(f.notices).toHaveLength(1);
+  expect(f.extracted.reviewNotification("101")?.notified).toBe(1);
+  expect(f.logs).toContain("hub_post_review_notification_recovered");
+});
+
+test("照合できるまでは再送せず、他の確認待ちを通知できる", async () => {
+  const f = fixture(); f.hold(); f.failNotify(true); await f.review.flush();
+  f.reopen(); f.failNotify(false); f.failFind(true); f.hold("date_missing", "102");
+  await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(f.notices[0]!.view.content).toContain("/102");
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ sending: 1, notified: 0 });
+  f.failFind(false); await f.review.flush();
+  expect(f.notices).toHaveLength(2);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ sending: 0, notified: 1 });
+  expect(f.logs.join()).not.toContain("secret");
+});
+
+test("送信後に設定が削除されても、旧宛先を照合して重複通知を防ぐ", async () => {
+  const f = fixture();
+  f.settings.configure({ guildId: "100", community: { ...community, id: 2 }, channelIds: ["10"],
+    notification: { type: "dm", userId } }, "100");
+  f.hold("multiple_communities", "101", "");
+  f.extracted.markReviewNotified = () => { throw new Error("停止を再現"); };
+  await f.review.flush(); f.settings.leave("100", 1); f.reopen(); await f.review.flush();
+  expect(f.lookups).toEqual([{ type: "channel", channelId: "11" }]);
+  expect(f.notices).toHaveLength(1);
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ community_id: 1, sending: 0, notified: 1 });
+});
+
+test("未送信の通知先の設定を消しても別の集会に通知する", async () => {
+  const f = fixture();
+  f.settings.configure({ guildId: "100", community: { ...community, id: 2 }, channelIds: ["10"],
+    notification: { type: "dm", userId } }, "100");
+  f.hold("multiple_communities", "101", ""); f.failNotify(true);
+  await f.review.flush();
+  f.settings.leave("100", 1); f.reopen();
+  expect(f.review.pendingPostReviews()).toBe(1);
+  expect(f.review.pendingPostReviews("100", 2)).toBe(1);
+  f.failNotify(false); await f.review.flush();
+  expect(f.notices).toHaveLength(1);
+  expect(f.notices[0]!.target).toEqual({ type: "dm", userId });
+  expect(f.extracted.reviewNotification("101")).toMatchObject({ community_id: 2, notified: 1 });
+});
+
+test("既存の通知テーブルに送信中の列を追加しても送信済み・無視済みを保持する", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hub-post-review-legacy-"));
+  const path = join(dir, "state.sqlite");
+  const db = new Database(path);
+  db.exec(`CREATE TABLE post_review_notifications (
+    message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, community_id INTEGER NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0, closed INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT INTO post_review_notifications VALUES ('101', '100', 1, 1, 0), ('102', '100', 1, 1, 1), ('103', '100', 1, 0, 0);`);
+  db.close();
+  const store = new ExtractionStore(path);
+  try {
+    expect(store.reviewNotification("101")).toMatchObject({ notified: 1, closed: 0, sending: 0, notification: "" });
+    expect(store.reviewNotification("102")).toMatchObject({ notified: 1, closed: 1, sending: 0, notification: "" });
+    store.reserveReviewNotification("103", "100", 2, { type: "dm", userId });
+    expect(store.reviewNotification("103")).toMatchObject({ community_id: 2, notified: 0, sending: 1,
+      notification: JSON.stringify({ type: "dm", userId }) });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("実際の抽出経路の確認待ちから本文を消し、リンクと理由だけを通知・保存する", async () => {
@@ -166,11 +254,28 @@ test("権限確認中に設定を外した投稿を閉じない", async () => {
 });
 
 test("通知失敗は次の周期で再試行し、他の確認待ちや受信処理を止めない", async () => {
-  const f = fixture(); f.hold(); f.failNotify(true); await f.review.flush();
-  expect(f.notices).toEqual([]); expect(f.extracted.reviewNotification("101")?.notified).toBe(0);
+  const f = fixture(); f.hold(); f.hold("date_missing", "102");
+  let firstNonce: string | undefined;
+  let failFirst = true;
+  f.beforeNotify(nonce => {
+    firstNonce ??= nonce;
+    if (failFirst && nonce === firstNonce) throw new Error("secret response body");
+  });
+  f.settings.save({ ...message("103"), authorId: userId, content: "新着の投稿",
+    sourceUrl: "https://discord.com/channels/100/10/103" });
+  const pipeline = new HubPipeline(f.settings, f.extracted, f.gateway,
+    { ask: async () => ({ classification: { answer: "application", confidence: 0.1 } }) }, f.hub, f.review);
+  await pipeline.run();
+  expect(f.notices).toHaveLength(2);
+  expect(f.notices.map(n => n.view.content.split("\n")[0])).toEqual([
+    "https://discord.com/channels/100/10/102", "https://discord.com/channels/100/10/103",
+  ]);
+  expect(f.settings.messages("10")).toEqual([]);
+  expect(f.extracted.pending("103")?.state).toBe("review");
+  expect(f.extracted.reviewNotification("101")?.notified).toBe(0);
   expect(f.logs).toContain("hub_post_review_notification_failed"); expect(f.logs.join()).not.toContain("secret");
-  f.reopen(); f.failNotify(false); await f.review.flush(); await f.review.flush();
-  expect(f.notices).toHaveLength(1);
+  f.reopen(); failFirst = false; await f.review.flush(); await f.review.flush();
+  expect(f.notices).toHaveLength(3);
 });
 
 test("複数集会の確認待ちは一件だけ通知し、集会別件数も二重に数えない", async () => {

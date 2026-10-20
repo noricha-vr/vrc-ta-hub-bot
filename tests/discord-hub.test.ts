@@ -199,9 +199,62 @@ test("edit button opens the hub URL and notification transports suppress all men
     await gateway.notify("100", { type: "dm", userId: "123456789012345678" }, view, "nonce-2");
     expect(users).toEqual(["123456789012345678"]);
     expect(sent).toHaveLength(2);
-    for (const message of sent) expect(message).toMatchObject({ allowedMentions: { parse: [], repliedUser: false }, enforceNonce: true });
+    for (const message of sent) expect(message).toMatchObject({ allowedMentions: { parse: [], repliedUser: false }, enforceNonce: true,
+      flags: MessageFlags.SuppressEmbeds });
     guildId = "200";
     await expect(gateway.notify("100", { type: "channel", channelId: "11" }, view, "nonce-3")).rejects.toThrow("configured guild");
     expect(sent).toHaveLength(2);
+  } finally { await gateway.stop(); }
+});
+
+for (const target of [{ type: "channel", channelId: "11" }, { type: "dm", userId: "123456789012345678" }] as const)
+test(`${target.type} の直近履歴から自分の nonce または通知ボタンを照合する`, async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  Object.defineProperty(client, "user", { value: { id: "20" } });
+  const buttonId = "hub-review:101:ignore";
+  const queries: unknown[] = [];
+  const users: string[] = [];
+  const channels: string[] = [];
+  let messages: unknown[] = [];
+  let historyAllowed = true;
+  let guildId = "100";
+  let historyDown = false;
+  let dmOpened = 0;
+  const channel = {
+    type: target.type === "dm" ? ChannelType.DM : ChannelType.GuildText,
+    get guildId() { return guildId; },
+    guild: { members: { me: { id: "20" } } },
+    permissionsFor: () => ({ has: () => historyAllowed }),
+    messages: { fetch: async (query: unknown) => {
+      queries.push(query);
+      if (historyDown) throw new Error("Synthetic history failure");
+      return new Map(messages.map((message, i) => [String(i), message]));
+    } },
+  };
+  client.channels.fetch = (async (id: string) => { channels.push(id); return channel; }) as unknown as typeof client.channels.fetch;
+  client.users.fetch = (async (id: string) => {
+    users.push(id);
+    return { createDM: async () => { dmOpened++; return channel; } };
+  }) as unknown as typeof client.users.fetch;
+  const own = (nonce: string | null, customId?: string) => ({ author: { id: "20" }, nonce,
+    components: customId ? [{ components: [{ customId }] }] : [] });
+  const find = () => gateway.findNotification("100", target, "nonce-1", buttonId);
+  try {
+    messages = [own("nonce-1")]; expect(await find()).toBe(true);
+    messages = [own(null, buttonId)]; expect(await find()).toBe(true);
+    messages = [{ ...own("nonce-1", buttonId), author: { id: "30" } }, own("other", "hub-review:102:ignore")];
+    expect(await find()).toBe(false);
+    messages = []; expect(await find()).toBe(false);
+    expect(queries).toEqual(Array(4).fill({ limit: 100, cache: false }));
+    if (target.type === "dm") {
+      expect(users).toEqual(Array(4).fill(target.userId)); expect(dmOpened).toBe(4); expect(channels).toEqual([]);
+    } else {
+      expect(channels).toEqual(Array(4).fill(target.channelId)); expect(users).toEqual([]);
+      historyAllowed = false; await expect(find()).rejects.toThrow("history permissions");
+      historyAllowed = true; guildId = "200"; await expect(find()).rejects.toThrow("Invalid notification channel");
+      guildId = "100";
+    }
+    historyDown = true; await expect(find()).rejects.toThrow("Synthetic history failure");
   } finally { await gateway.stop(); }
 });

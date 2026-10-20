@@ -1,4 +1,4 @@
-import { Client, ChannelType, Events, GatewayIntentBits, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
+import { Client, ChannelType, Events, GatewayIntentBits, MessageFlags, Options, PermissionFlagsBits, type ClientOptions, type Message, type Guild, type Interaction } from "discord.js";
 import type { NotificationTarget } from "./hub-store";
 import type { HubView } from "./hub-setup";
 import { discordHubView, hubCommand, hubInteraction, validateHubChannels } from "./discord-hub";
@@ -117,7 +117,7 @@ export class DiscordGateway implements Gateway {
   }
 
   async notify(guildId: string, target: NotificationTarget, view: HubView, nonce: string): Promise<void> {
-    const payload = { ...discordHubView(view), nonce, enforceNonce: true };
+    const payload = { ...discordHubView(view), nonce, enforceNonce: true, flags: MessageFlags.SuppressEmbeds as const };
     if (target.type === "dm") {
       const user = await this.client.users.fetch(target.userId);
       await user.send(payload);
@@ -128,6 +128,29 @@ export class DiscordGateway implements Gateway {
       throw new Error("Notification channel must belong to configured guild");
     }
     await channel.send(payload);
+  }
+
+  /** SDK のキャッシュや短時間の nonce 重複排除に頼らず、自分の通知を照合する。 */
+  async findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string): Promise<boolean> {
+    const channel = target.type === "dm"
+      ? await (await this.client.users.fetch(target.userId)).createDM()
+      : await this.client.channels.fetch(target.channelId);
+    if (!channel || (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
+      throw new Error("Invalid notification channel");
+    }
+    if (target.type === "dm" ? channel.type !== ChannelType.DM : channel.type === ChannelType.DM || channel.guildId !== guildId) {
+      throw new Error("Invalid notification channel");
+    }
+    if (channel.type !== ChannelType.DM) {
+      const me = channel.guild.members.me ?? await channel.guild.members.fetchMe();
+      if (!channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])) {
+        throw new Error("Notification channel lacks history permissions");
+      }
+    }
+    const messages = await channel.messages.fetch({ limit: 100, cache: false });
+    return [...messages.values()].some(message => message.author.id === this.client.user?.id
+      && (message.nonce === nonce || message.components.some(row => "components" in row
+        && row.components.some(component => "customId" in component && component.customId === buttonId))));
   }
 
   async validateChannels(guildId: string, channelIds: string[], purpose: "read" | "notify", userId: string): Promise<void> {

@@ -3,7 +3,11 @@ import type { HubApi } from "./hub-api";
 import type { ExtractionStore, PendingPost } from "./extraction-store";
 import type { HubReviewGateway } from "./hub-review";
 import type { HubInteraction, HubView } from "./hub-setup";
-import type { HubSetting, HubStore } from "./hub-store";
+import type { HubSetting, HubStore, NotificationTarget } from "./hub-store";
+
+export interface HubPostReviewGateway extends HubReviewGateway {
+  findNotification(guildId: string, target: NotificationTarget, nonce: string, buttonId: string): Promise<boolean>;
+}
 
 const reasons: Record<string, string> = {
   uncertain: "応募か続報かを確信を持って判断できません。",
@@ -25,7 +29,7 @@ const text = (content: string): HubView => ({ content, controls: [] });
 /** 本文を持たない確認待ちを、投稿ごとに一度だけ通知する。 */
 export class HubPostReview {
   constructor(
-    private readonly gateway: HubReviewGateway,
+    private readonly gateway: HubPostReviewGateway,
     private readonly settings: HubStore,
     private readonly extracted: ExtractionStore,
     private readonly hub: Pick<HubApi, "communities" | "registrationUrl">,
@@ -40,7 +44,7 @@ export class HubPostReview {
     if (recorded?.closed) return;
     return this.settings.messageSettings(source.channelId, source.messageId, true).find(s => s.guildId === match[1]
       && (!post.meetingId || String(s.community.id) === post.meetingId)
-      && (!recorded || (s.guildId === recorded.guild_id && s.community.id === recorded.community_id)));
+      && (!recorded?.notified || (s.guildId === recorded.guild_id && s.community.id === recorded.community_id)));
   }
 
   count(guildId?: string, communityId?: number): number {
@@ -53,18 +57,29 @@ export class HubPostReview {
 
   async flush(): Promise<void> {
     for (const post of this.extracted.reviewPosts()) {
-      const setting = this.target(post);
-      if (!setting || this.extracted.reviewNotification(post.source.messageId)?.notified) continue;
+      const recorded = this.extracted.reviewNotification(post.source.messageId);
+      if (recorded?.notified || recorded?.closed) continue;
       try {
-        this.extracted.reserveReviewNotification(post.source.messageId, setting.guildId, setting.community.id);
+        const nonce = createHash("sha256").update(`post-review:${post.source.messageId}`).digest("hex").slice(0, 24);
+        const buttonId = `hub-review:${post.source.messageId}:ignore`;
+        // 設定が変わっても、送信した可能性のある旧宛先を先に確認する。
+        // 履歴の取得失敗は未送信の証拠にならないため、再送せず次の周期で照合する。
+        if (recorded?.sending && await this.gateway.findNotification(recorded.guild_id,
+          JSON.parse(recorded.notification) as NotificationTarget, nonce, buttonId)) {
+          this.extracted.markReviewNotified(post.source.messageId);
+          this.log("hub_post_review_notification_recovered");
+          continue;
+        }
+        const setting = this.target(post);
+        if (!setting) continue;
         const view: HubView = {
           content: `${post.source.url}\n理由：${reasons[post.reason] ?? "自動で処理できないため確認が必要です。"}`,
           controls: [{ type: "buttons", buttons: [
             { url: this.hub.registrationUrl(setting.community.id), label: "Hubで登録する" },
-            { id: `hub-review:${post.source.messageId}:ignore`, label: "無視する" },
+            { id: buttonId, label: "無視する" },
           ] }],
         };
-        const nonce = createHash("sha256").update(`post-review:${post.source.messageId}`).digest("hex").slice(0, 24);
+        this.extracted.reserveReviewNotification(post.source.messageId, setting.guildId, setting.community.id, setting.notification);
         await this.gateway.notify(setting.guildId, setting.notification, view, nonce);
         this.extracted.markReviewNotified(post.source.messageId);
         this.log("hub_post_review_notified");

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { mergeMaterials, type Material } from "./extraction-fields";
+import type { NotificationTarget } from "./hub-store";
 
 export interface PostReference {
   messageId: string;
@@ -68,6 +69,8 @@ export interface PostReviewNotification {
   community_id: number;
   notified: number;
   closed: number;
+  sending: number;
+  notification: string;
 }
 
 /** 抽出済みの項目と出典だけを保存する。受信箱とは独立し、本文の列を持たない。 */
@@ -113,9 +116,20 @@ export class ExtractionStore {
         guild_id TEXT NOT NULL,
         community_id INTEGER NOT NULL,
         notified INTEGER NOT NULL DEFAULT 0,
-        closed INTEGER NOT NULL DEFAULT 0
+        closed INTEGER NOT NULL DEFAULT 0,
+        sending INTEGER NOT NULL DEFAULT 0,
+        notification TEXT NOT NULL DEFAULT ''
       );
     `);
+    this.db.transaction(() => {
+      const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(post_review_notifications)").all();
+      if (!columns.some(c => c.name === "sending")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN sending INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columns.some(c => c.name === "notification")) {
+        this.db.exec("ALTER TABLE post_review_notifications ADD COLUMN notification TEXT NOT NULL DEFAULT ''");
+      }
+    }).immediate();
   }
 
   get(id: string): TalkDraft | undefined {
@@ -244,13 +258,18 @@ export class ExtractionStore {
       .get(messageId) ?? undefined;
   }
 
-  reserveReviewNotification(messageId: string, guildId: string, communityId: number): void {
-    this.db.query("INSERT OR IGNORE INTO post_review_notifications (message_id, guild_id, community_id) VALUES (?, ?, ?)")
-      .run(messageId, guildId, communityId);
+  /** 外部送信より先に宛先を保存し、成否不明なら次の周期で旧宛先を照合する。 */
+  reserveReviewNotification(messageId: string, guildId: string, communityId: number, notification: NotificationTarget): void {
+    this.db.query(`INSERT INTO post_review_notifications (message_id, guild_id, community_id, sending, notification)
+      VALUES (?, ?, ?, 1, ?)
+      ON CONFLICT(message_id) DO UPDATE SET guild_id = excluded.guild_id, community_id = excluded.community_id,
+        sending = 1, notification = excluded.notification
+      WHERE notified = 0 AND closed = 0`)
+      .run(messageId, guildId, communityId, JSON.stringify(notification));
   }
 
   markReviewNotified(messageId: string): void {
-    this.db.query("UPDATE post_review_notifications SET notified = 1 WHERE message_id = ?").run(messageId);
+    this.db.query("UPDATE post_review_notifications SET notified = 1, sending = 0 WHERE message_id = ?").run(messageId);
   }
 
   /** 閉じた記録も残し、同じ投稿の再取り込みで通知し直さない。 */
