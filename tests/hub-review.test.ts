@@ -256,6 +256,22 @@ test("照合 API の停止も空一覧とみなさず再試行し、後で復旧
   f.advance(); f.setLookupDown(false); await f.review.flush(); expect(f.notifications).toHaveLength(1);
 });
 
+for (const status of ["archived", "", undefined, null, 42]) test(`作成照合の未知の status ${String(status)} は確定せずバックオフし、pending で復帰する`, async () => {
+  const f = fixture(); const draft = f.create(); f.setCreateFailure("lost"); await f.review.flush();
+  f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status }]);
+  f.advance(300); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "creating", hub_id: null,
+    attempts: 2, next_at: 1900, reason: "hub_create_status_unknown" });
+  expect(f.settings.drafts("100", 1)).toEqual([]); expect(f.notifications).toEqual([]);
+  expect(f.log).toContain("hub_create_status_unknown");
+  f.reopen(); const before = f.calls.length;
+  f.advance(599); await f.review.flush(); expect(f.calls).toHaveLength(before);
+  f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "pending" }]);
+  f.advance(1); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42, attempts: 0, next_at: 0 });
+  expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(1);
+});
+
 test("PATCH と通知の失敗は再送し、新たな下書きを作らない", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   f.followUp(draft); f.setPatchDown(true); await f.review.flush();
@@ -890,6 +906,42 @@ for (const delivered of [false, true]) test(`別サーバーの再設定後に�
   expect(f.settings.drafts("200", 1)[0]).toMatchObject({ id: "42", guildId: "200", approved: false });
   expect(f.notifications).toHaveLength(delivered ? 2 : 1);
   expect(f.notifications.at(-1)).toMatchObject({ guildId: "200", target: { type: "channel", channelId: "21" } });
+});
+
+for (const guildId of ["100", "200"]) test(`未作成の下書きの復帰は現設定の出典で作成・照合する（サーバー: ${guildId}）`, async () => {
+  const f = fixture(); const draft = f.create(); f.setEventsDown(true); await f.review.flush();
+  f.settings.leave("100", 1);
+  f.settings.configure({ guildId, community, channelIds: ["20"], notification: { type: "channel", channelId: "21" } }, "200");
+  const merge = (id: string) => f.extracted.create({ meetingId: draft.meetingId, presenterId: draft.presenterId,
+    presenterName: draft.presenterName, eventDate: draft.eventDate, title: draft.title, materials: draft.materials },
+    { messageId: id, channelId: "20", url: `https://discord.com/channels/${guildId}/20/${id}` });
+  expect(merge("199").draft.id).toBe(draft.id);
+  f.setEventsDown(false); await f.review.flush(); expect(f.createCount).toBe(0);
+  expect(merge("201").draft.id).toBe(draft.id);
+  f.setCreateFailure("lost"); await f.review.flush();
+  const sourceUrl = `https://discord.com/channels/${guildId}/20/201`;
+  expect(f.calls.find(c => c.path === "/api/v1/event-details/" && c.method === "POST")?.body?.source_url).toBe(sourceUrl);
+  merge("202"); f.reopen(); f.advance(300); await f.review.flush();
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "ready", hub_id: 42 });
+  expect(f.createCount).toBe(1); expect(f.notifications).toHaveLength(1);
+  expect(f.settings.drafts(guildId, 1)[0]?.sourceUrl).toBe(sourceUrl);
+  f.setReviewFailure("lost"); await f.review.handle(interaction(draft.id, "approved", guildId).i);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
+  expect(f.settings.drafts(guildId, 1)[0]).toMatchObject({ sourceUrl, approved: true });
+});
+
+for (const decision of ["approved", "rejected"] as const) test(`同期済みの ${decision} は配送待ちから外し、続報がある時だけ資料を同期する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  await f.review.handle(interaction(draft.id, decision).i);
+  expect(f.deliveries.due(1000)).toEqual([]);
+  f.reopen(); f.advance(); await f.review.flush();
+  expect(f.deliveries.due(100000)).toEqual([]);
+  const before = f.calls.length;
+  f.followUp(draft); await f.review.flush();
+  expect(f.calls.slice(before).map(c => c.method)).toEqual(["PATCH"]);
+  expect(f.deliveries.due(100000)).toEqual([]);
+  await f.review.flush(); expect(f.calls).toHaveLength(before + 1);
+  expect(f.notifications).toHaveLength(1);
 });
 
 test("設定のない配送と判断の保留は健康状態の集計から除く", async () => {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { HubApiError, type HubDetailFields, type HubReviewApi } from "./hub-api";
 import { HubDeliveryStore, type HubDelivery, type HubReviewDecision } from "./hub-delivery-store";
 import { httpUrl } from "./extraction-fields";
-import type { ExtractionStore, TalkDraft } from "./extraction-store";
+import type { ExtractionStore, PostReference, TalkDraft } from "./extraction-store";
 import type { HubSetting, HubStore, NotificationTarget } from "./hub-store";
 import type { HubInteraction, HubView } from "./hub-setup";
 
@@ -32,30 +32,34 @@ export class HubReview {
   private setting(row: HubDelivery): HubSetting | undefined {
     const draft = this.extracted.get(row.draft_id);
     if (draft?.meetingId !== String(row.community_id)) return;
-    return this.draftSetting(draft, row.guild_id);
+    return this.draftTarget(draft, row.guild_id)?.setting;
   }
 
-  private draftSetting(draft: TalkDraft, guildId?: string): HubSetting | undefined {
+  private draftTarget(draft: TalkDraft, guildId?: string): { setting: HubSetting; source: PostReference } | undefined {
     for (const source of draft.sources) {
       const match = /^https:\/\/discord\.com\/channels\/([0-9]{1,20})\/([0-9]{1,20})\/([0-9]{1,20})$/.exec(source.url);
       if (!match || source.channelId !== match[2] || source.messageId !== match[3] || (guildId && guildId !== match[1])) continue;
       const setting = this.settings.messageSettings(source.channelId, source.messageId)
         .find(s => s.guildId === match[1] && String(s.community.id) === draft.meetingId);
-      if (setting) return setting;
+      if (setting) return { setting, source };
     }
   }
 
   /** 抽出保存と enqueue の間で停止しても、抽出済み項目から復旧する。 */
-  private enqueue(): void {
+  private enqueue(): string[] {
+    const changed: string[] = [];
     for (const draft of this.extracted.allDrafts()) {
-      const setting = this.draftSetting(draft);
+      const setting = this.draftTarget(draft)?.setting;
       if (!setting) continue;
       const previous = this.deliveries.get(draft.id);
       this.deliveries.enqueue(draft.id, setting.guildId, setting.community.id);
+      if (previous?.state === "closed" && ["approved", "rejected"].includes(previous.reason)
+        && previous.synced_hash !== fingerprint(draft)) changed.push(draft.id);
       if (previous?.state === "closed" && previous.reason === "setting_removed" && previous.hub_id) {
         this.recordDraft(this.deliveries.get(draft.id)!, draft, previous.hub_id, false);
       }
     }
+    return changed;
   }
 
   flush(): Promise<void> {
@@ -78,8 +82,8 @@ export class HubReview {
     };
   }
   private async run(): Promise<void> {
-    this.enqueue();
-    for (const row of this.deliveries.due(this.now())) {
+    const changed = this.enqueue();
+    for (const row of this.deliveries.due(this.now(), changed)) {
       if (this.busy.has(row.draft_id) || !this.setting(row)) continue;
       const unlock = await this.lock(row.draft_id);
       try { await this.deliver(row.draft_id); }
@@ -118,42 +122,53 @@ export class HubReview {
     if (row.state === "closed") { await this.syncClosed(id); return; }
     const draft = this.extracted.get(id);
     if (!draft) return;
+    // 送信済みなら同じ出典で照合する。旧形式の作成は先頭の出典を使っていた。
+    const sourceUrl = row.source_url || (row.attempted_hash ? draft.sources[0]?.url : undefined);
+    const source = sourceUrl
+      ? draft.sources.find(s => s.url === sourceUrl)
+      : this.draftTarget(draft, row.guild_id)?.source;
+    if (!source) return;
     const hash = fingerprint(draft);
     if (row.state === "creating") {
-      const found = await this.hub.findDraft(draft.sources[0]!.url);
+      const found = await this.hub.findDraft(source.url);
       if (!found) {
-        this.extracted.holdReview(draft.meetingId, draft.presenterId, draft.sources[0]!, "hub_create_unconfirmed", this.now());
+        this.extracted.holdReview(draft.meetingId, draft.presenterId, source, "hub_create_unconfirmed", this.now());
         this.deliveries.retry(row.draft_id, this.now(), "hub_create_unconfirmed");
         this.log("hub_create_unconfirmed");
         return;
       }
+      if (found.status !== "pending" && found.status !== "approved" && found.status !== "rejected") {
+        this.deliveries.retry(row.draft_id, this.now(), "hub_create_status_unknown");
+        this.log("hub_create_status_unknown");
+        return;
+      }
       this.deliveries.created(row.draft_id, found.id, row.attempted_hash);
-      if (this.extracted.pending(draft.sources[0]!.messageId)?.reason === "hub_create_unconfirmed") {
-        this.extracted.clearPending(draft.sources[0]!.messageId);
+      row = this.deliveries.get(row.draft_id)!;
+      if (this.extracted.pending(source.messageId)?.reason === "hub_create_unconfirmed") {
+        this.extracted.clearPending(source.messageId);
       }
       this.recordDraft(row, draft, found.id, found.status === "approved");
-      if (found.status && found.status !== "pending") {
+      if (found.status === "approved" || found.status === "rejected") {
         this.deliveries.closed(row.draft_id, found.status); return;
       }
-      row = this.deliveries.get(row.draft_id)!;
     }
     if (row.state === "queued") {
       // 読み取りで疎通・対象イベントを確認してから POST を試みる。
       const events = (await this.hub.events(row.community_id)).filter(e => e.date === draft.eventDate);
       if (events.length !== 1 || !this.setting(row)) throw new HubApiError();
       const fields = this.fields(draft, events[0]!.id);
-      this.deliveries.creating(row.draft_id, hash);
+      this.deliveries.creating(row.draft_id, hash, source.url);
       let id: number;
-      try { id = await this.hub.createDraft(fields, draft.sources[0]!.url); }
+      try { id = await this.hub.createDraft(fields, source.url); }
       catch (error) {
         // 処理前の拒否だけ再送する。保存された可能性があれば creating を残して照合する。
         if (error instanceof HubApiError && [400, 401, 403, 404, 422, 429].includes(error.status)) this.deliveries.requeue(row.draft_id);
         throw error;
       }
       this.deliveries.created(row.draft_id, id, hash);
+      row = this.deliveries.get(row.draft_id)!;
       this.recordDraft(row, draft, id, false);
       this.log("hub_draft_created");
-      row = this.deliveries.get(row.draft_id)!;
     } else if (row.synced_hash !== hash) {
       await this.sync(row, draft);
       row = this.deliveries.get(row.draft_id)!;
@@ -188,7 +203,7 @@ export class HubReview {
 
   private recordDraft(row: HubDelivery, draft: TalkDraft, id: number, approved: boolean): void {
     if (this.setting(row)) this.settings.saveDraft({ id: String(id), guildId: row.guild_id, communityId: row.community_id,
-      sourceUrl: draft.sources[0]!.url, createdAt: new Date(this.now() * 1000).toISOString(), approved });
+      sourceUrl: row.source_url || draft.sources[0]!.url, createdAt: new Date(this.now() * 1000).toISOString(), approved });
   }
 
   private async finishDecision(row: HubDelivery, decision: "approved" | "rejected"): Promise<void> {
@@ -232,7 +247,7 @@ export class HubReview {
         if (error instanceof HubApiError && [400, 401, 404, 422, 429].includes(error.status)) throw error;
         // 409 と成否不明の応答は、他の利用者の保留に関係なく現在状態を照合する。
         const draft = this.extracted.get(row.draft_id)!;
-        const found = await this.hub.findDraft(draft.sources[0]!.url);
+        const found = await this.hub.findDraft(row.source_url || draft.sources[0]!.url);
         if (found?.id !== row.hub_id || (found.status !== "approved" && found.status !== "rejected")) throw new HubApiError();
         await this.finishDecision(row, found.status);
         this.log("hub_review_already_processed"); return "processed";

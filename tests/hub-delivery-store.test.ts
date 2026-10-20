@@ -45,6 +45,7 @@ test("旧 DB の保留は操作者・判断・試行回数・再送時刻を保�
     expect(store.decision("draft-2", "456")).toMatchObject({ draft_id: "draft-2", discord_id: "456",
       decision: "rejected", attempts: 2, next_at: 1600 });
     expect(store.get("draft-1")).toMatchObject({ state: "ready", hub_id: 42, attempts: 0, next_at: 0, reason: "" });
+    expect(store.get("draft-1")?.source_url).toBe("");
     expect(store.get("queued")).toMatchObject({ state: "queued", attempts: 4, next_at: 3400, reason: "hub_delivery_failed" });
     expect(store.decisions("queued")).toEqual([]); expect(store.decisions("closed")).toEqual([]);
     expect(store.dueDecisions(1599)).toEqual([]);
@@ -138,5 +139,37 @@ test("操作者ごとに保留とバックオフを持ち、押し直しと 403 
     expect(store.decisions("draft")).toEqual([]); expect(store.counts().retry).toBe(0);
     store.close(); store = new HubDeliveryStore(path);
     expect(store.dueDecisions(10000)).toEqual([]);
+  } finally { store.close(); }
+});
+
+test("閉じた配送は資料の変更か再試行がある時だけ返し、再送時刻と取り外しを守る", () => {
+  const store = new HubDeliveryStore(databasePath());
+  try {
+    for (const id of ["approved", "rejected", "removed", "ready"]) {
+      store.enqueue(id, "100", 1); store.created(id, 42, "hash");
+    }
+    store.closed("approved", "approved"); store.closed("rejected", "rejected"); store.closed("removed", "setting_removed");
+    expect(store.due(1000).map(row => row.draft_id)).toEqual(["ready"]);
+    expect(store.due(1000, ["approved", "removed"]).map(row => row.draft_id)).toEqual(["approved", "ready"]);
+    store.retry("rejected", 1000, "hub_delivery_failed");
+    expect(store.due(1299, ["rejected"]).map(row => row.draft_id)).toEqual(["ready"]);
+    expect(store.due(1300).map(row => row.draft_id)).toEqual(["rejected", "ready"]);
+    store.synced("rejected", "changed");
+    expect(store.due(1300).map(row => row.draft_id)).toEqual(["ready"]);
+    expect(store.get("rejected")).toMatchObject({ state: "closed", reason: "rejected", synced_hash: "changed", attempts: 0 });
+  } finally { store.close(); }
+});
+
+test("作成時の出典を再起動と取り外し後も保持し、未作成が確定した再送では選び直せる", () => {
+  const path = databasePath(); let store = new HubDeliveryStore(path);
+  try {
+    const sourceUrl = "https://discord.com/channels/100/10/201";
+    store.enqueue("draft", "100", 1); store.creating("draft", "hash", sourceUrl);
+    store.close(); store = new HubDeliveryStore(path);
+    expect(store.get("draft")).toMatchObject({ state: "creating", source_url: sourceUrl, attempted_hash: "hash" });
+    store.closed("draft", "setting_removed"); store.enqueue("draft", "200", 1);
+    expect(store.get("draft")).toMatchObject({ state: "creating", guild_id: "200", source_url: sourceUrl });
+    store.requeue("draft");
+    expect(store.get("draft")).toMatchObject({ state: "queued", source_url: "", attempted_hash: "" });
   } finally { store.close(); }
 });

@@ -10,6 +10,7 @@ export interface HubDelivery {
   hub_id: number | null;
   state: "queued" | "creating" | "ready" | "closed";
   attempted_hash: string;
+  source_url: string;
   synced_hash: string;
   notified_hash: string;
   attempts: number;
@@ -43,7 +44,7 @@ export class HubDeliveryStore {
       CREATE TABLE IF NOT EXISTS hub_deliveries (
         draft_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, community_id INTEGER NOT NULL,
         hub_id INTEGER, state TEXT NOT NULL DEFAULT 'queued',
-        attempted_hash TEXT NOT NULL DEFAULT '', synced_hash TEXT NOT NULL DEFAULT '',
+        attempted_hash TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '', synced_hash TEXT NOT NULL DEFAULT '',
         notified_hash TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
         next_at INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
         decision TEXT, discord_id TEXT
@@ -62,6 +63,9 @@ export class HubDeliveryStore {
     // 旧形式の保留と再送時刻を、取り込み済みの行を上書きせずに移す。
     this.db.transaction(() => {
       const now = Math.floor(Date.now() / 1000);
+      if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_deliveries)").all().some(c => c.name === "source_url")) {
+        this.db.exec("ALTER TABLE hub_deliveries ADD COLUMN source_url TEXT NOT NULL DEFAULT ''");
+      }
       if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_review_decisions)").all().some(c => c.name === "created_at")) {
         this.db.exec("ALTER TABLE hub_review_decisions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0");
         this.db.query("UPDATE hub_review_decisions SET created_at = ?").run(now);
@@ -87,17 +91,18 @@ export class HubDeliveryStore {
   get(id: string): HubDelivery | undefined {
     return this.db.query<HubDelivery, [string]>("SELECT * FROM hub_deliveries WHERE draft_id = ?").get(id) ?? undefined;
   }
-  due(now: number): HubDelivery[] {
-    return this.db.query<HubDelivery, [number]>(
-      "SELECT * FROM hub_deliveries WHERE (state <> 'closed' OR reason IN ('approved', 'rejected')) AND next_at <= ? ORDER BY rowid",
-    ).all(now);
+  due(now: number, changed: readonly string[] = []): HubDelivery[] {
+    return this.db.query<HubDelivery, [string, number]>(`SELECT * FROM hub_deliveries WHERE (
+      state <> 'closed' OR (reason IN ('approved', 'rejected') AND (
+        attempts > 0 OR draft_id IN (SELECT value FROM json_each(?))
+      ))) AND next_at <= ? ORDER BY rowid`).all(JSON.stringify(changed), now);
   }
-  creating(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ? WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
+  creating(id: string, hash: string, sourceUrl = ""): void {
+    this.db.query("UPDATE hub_deliveries SET state = 'creating', attempted_hash = ?, source_url = ? WHERE draft_id = ? AND state <> 'closed'").run(hash, sourceUrl, id);
   }
   requeue(id: string): void {
     this.db.query(`UPDATE hub_deliveries SET state = CASE WHEN state = 'closed' THEN 'closed' ELSE 'queued' END,
-      attempted_hash = '' WHERE draft_id = ?`).run(id);
+      attempted_hash = '', source_url = '' WHERE draft_id = ?`).run(id);
   }
   created(id: string, hubId: number, hash: string): void {
     this.db.query(`UPDATE hub_deliveries SET state = 'ready', hub_id = ?, synced_hash = ?,
