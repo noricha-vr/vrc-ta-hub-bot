@@ -114,7 +114,8 @@ export class HubReview {
 
   private async deliver(id: string): Promise<void> {
     let row = this.deliveries.get(id);
-    if (!row || row.state === "closed" || !this.setting(row)) return;
+    if (!row || !this.setting(row)) return;
+    if (row.state === "closed") { await this.syncClosed(id); return; }
     const draft = this.extracted.get(id);
     if (!draft) return;
     const hash = fingerprint(draft);
@@ -191,21 +192,37 @@ export class HubReview {
   }
 
   private async finishDecision(row: HubDelivery, decision: "approved" | "rejected"): Promise<void> {
-    for (;;) {
-      const current = this.deliveries.get(row.draft_id)!;
-      if (current.state === "closed" || !this.setting(current)) return;
-      const draft = this.extracted.get(row.draft_id)!;
-      if (current.synced_hash !== fingerprint(draft)) { await this.sync(current, draft); continue; }
-      this.recordDraft(current, draft, current.hub_id!, decision === "approved");
-      this.deliveries.closed(current.draft_id, decision);
-      return;
+    const current = this.deliveries.get(row.draft_id);
+    if (!current || current.state === "closed" || !this.setting(current)) return;
+    const draft = this.extracted.get(current.draft_id)!;
+    // 判断は資料の更新より先に確定し、更新の失敗で再送待ちに戻さない。
+    this.recordDraft(current, draft, current.hub_id!, decision === "approved");
+    this.deliveries.closed(current.draft_id, decision);
+    try { await this.syncClosed(current.draft_id); }
+    catch {
+      this.deliveries.retry(current.draft_id, this.now(), "hub_delivery_failed");
+      this.log("hub_delivery_retry");
     }
   }
 
-  private async submitDecision(row: HubDelivery, pending: HubReviewDecision): Promise<"done" | "forbidden" | "processed"> {
+  private async syncClosed(id: string): Promise<void> {
+    for (;;) {
+      const current = this.deliveries.get(id);
+      if (!current?.hub_id || current.state !== "closed" || !["approved", "rejected"].includes(current.reason) || !this.setting(current)) return;
+      const draft = this.extracted.get(id);
+      if (!draft || current.synced_hash === fingerprint(draft)) return;
+      await this.sync(current, draft);
+    }
+  }
+
+  private async submitDecision(row: HubDelivery, pending: HubReviewDecision): Promise<"done" | "forbidden" | "processed" | "cancelled"> {
     this.sending.set(row.draft_id, pending.discord_id);
     try {
       await this.sync(row, this.extracted.get(row.draft_id)!);
+      const current = this.deliveries.get(row.draft_id);
+      const decision = this.deliveries.decision(row.draft_id, pending.discord_id);
+      if (!current?.hub_id || current.state === "closed" || !this.setting(current) || !decision) return "cancelled";
+      row = current; pending = decision;
       try { await this.hub.reviewDraft(row.hub_id!, pending.decision, pending.discord_id); }
       catch (error) {
         if (error instanceof HubApiError && error.status === 403) {
@@ -259,7 +276,7 @@ export class HubReview {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
       const current = this.deliveries.decision(row.draft_id, i.userId)!;
-      let outcome: "done" | "forbidden" | "processed";
+      let outcome: "done" | "forbidden" | "processed" | "cancelled";
       try {
         outcome = await this.submitDecision(row, current);
       } catch {
@@ -270,6 +287,7 @@ export class HubReview {
       }
       await i.edit(text(outcome === "forbidden" ? "この発表を承認・却下できる主催者ではありません。"
         : outcome === "processed" ? "この発表はすでに処理済みです。Hub で現在の状態を確認してください。"
+        : outcome === "cancelled" ? "この通知は古くなりました。/hub status で現在の設定を確認してください。"
         : current.decision === "approved" ? "承認しました。" : "却下しました。"));
     } catch {
       this.log("hub_review_failed");

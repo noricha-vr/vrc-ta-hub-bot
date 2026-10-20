@@ -89,7 +89,7 @@ export class HubDeliveryStore {
   }
   due(now: number): HubDelivery[] {
     return this.db.query<HubDelivery, [number]>(
-      "SELECT * FROM hub_deliveries WHERE state <> 'closed' AND next_at <= ? ORDER BY rowid",
+      "SELECT * FROM hub_deliveries WHERE (state <> 'closed' OR reason IN ('approved', 'rejected')) AND next_at <= ? ORDER BY rowid",
     ).all(now);
   }
   creating(id: string, hash: string): void {
@@ -104,7 +104,9 @@ export class HubDeliveryStore {
       attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'`).run(hubId, hash, id);
   }
   synced(id: string, hash: string): void {
-    this.db.query("UPDATE hub_deliveries SET synced_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
+    this.db.query(`UPDATE hub_deliveries SET synced_hash = ?, attempts = 0, next_at = 0,
+      reason = CASE WHEN state = 'closed' THEN reason ELSE '' END
+      WHERE draft_id = ? AND (state <> 'closed' OR reason IN ('approved', 'rejected'))`).run(hash, id);
   }
   notified(id: string, hash: string): void {
     this.db.query("UPDATE hub_deliveries SET notified_hash = ?, attempts = 0, next_at = 0, reason = '' WHERE draft_id = ? AND state <> 'closed'").run(hash, id);
@@ -112,7 +114,8 @@ export class HubDeliveryStore {
   retry(id: string, now: number, reason: string): void {
     const attempts = (this.get(id)?.attempts ?? 0) + 1;
     const delay = Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
-    this.db.query("UPDATE hub_deliveries SET attempts = ?, next_at = ?, reason = ? WHERE draft_id = ? AND state <> 'closed'")
+    this.db.query(`UPDATE hub_deliveries SET attempts = ?, next_at = ?, reason = CASE WHEN state = 'closed' THEN reason ELSE ? END
+      WHERE draft_id = ? AND (state <> 'closed' OR reason IN ('approved', 'rejected'))`)
       .run(attempts, now + delay, reason, id);
   }
   queueDecision(id: string, decision: ReviewDecision, discordId: string, now = Math.floor(Date.now() / 1000)): boolean {
@@ -172,7 +175,7 @@ export class HubDeliveryStore {
   }
   closed(id: string, reason: string): void {
     this.db.transaction(() => {
-      this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, decision = NULL, discord_id = NULL WHERE draft_id = ?")
+      this.db.query("UPDATE hub_deliveries SET state = 'closed', reason = ?, attempts = 0, next_at = 0, decision = NULL, discord_id = NULL WHERE draft_id = ?")
         .run(reason, id);
       this.db.query("DELETE FROM hub_review_decisions WHERE draft_id = ?").run(id);
     })();
@@ -185,11 +188,14 @@ export class HubDeliveryStore {
       ) GROUP BY state`,
     ).all()) counts[row.state] = row.n;
     counts.retry = this.db.query<{ n: number }, []>(`SELECT count(*) AS n FROM hub_deliveries d
-      WHERE state <> 'closed' AND EXISTS (
+      WHERE EXISTS (
         SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
-      ) AND (reason <> '' OR EXISTS (
-        SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
-      ))`).get()!.n;
+      ) AND (
+        (state = 'closed' AND reason IN ('approved', 'rejected') AND attempts > 0) OR
+        (state <> 'closed' AND (reason <> '' OR EXISTS (
+          SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
+        )))
+      )`).get()!.n;
     return counts;
   }
   close(): void { this.db.close(); }
