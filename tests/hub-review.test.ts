@@ -378,6 +378,39 @@ for (const status of [403, 409]) test(status === 403
   }
 });
 
+test("承認後の続報でも、届いている通知の本文だけを書き換えて結果とリンクを残す", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.edits).toHaveLength(1);
+  f.followUp(draft); await f.review.flush();
+  expect(f.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
+  expect(f.notifications).toHaveLength(1);
+  expect(f.edits).toHaveLength(1);
+  expect(f.updates).toHaveLength(1);
+  expect(f.updates[0]!.reference).toEqual({ channelId: "11", messageId: "501" });
+  expect(f.updates[0]!.view.content.split("\n")[4]).toBe("資料：https://example.invalid/slides/one ほか 1 件");
+  f.reopen(); await f.review.flush(); expect(f.updates).toHaveLength(1);
+});
+
+test("承認後の本文更新が失敗したら再試行として数え、成功後に戻す", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  await f.review.handle(interaction(draft.id).i);
+  f.setEditDown(true); f.followUp(draft); await f.review.flush();
+  expect(f.updates).toHaveLength(1); expect(f.deliveries.counts().retry).toBe(1);
+  f.setEditDown(false); f.advance(300); await f.review.flush();
+  expect(f.updates).toHaveLength(2); expect(f.deliveries.counts().retry).toBe(0);
+});
+
+test("本文の分からない旧記録の通知は、承認後の続報でも書き換えない", async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  await f.review.handle(interaction(draft.id).i);
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try { db.query("UPDATE hub_review_notifications SET content_hash = ''").run(); } finally { db.close(); }
+  f.followUp(draft); await f.review.flush();
+  expect(f.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
+  expect(f.updates).toHaveLength(0);
+});
+
 for (const [error, reason] of [
   [{ code: 10008, status: 404 }, "unknown_message"],
   [{ code: 10008 }, "unknown_message"],
@@ -1550,8 +1583,10 @@ for (const decision of ["approved", "rejected"]) test(`続報の編集待ちが�
   f.setEditDown(false); f.followUp(draft, "103"); f.reopen(); f.advance(300); await f.review.flush();
   expect(f.notifications).toHaveLength(1); expect(f.updates).toHaveLength(1);
   expect(f.edits.at(-1)?.result).toBe(`${decision === "approved" ? "承認済み" : "却下"}（運営）`);
-  const count = f.updates.length; f.followUp(draft, "104"); await f.review.flush();
-  expect(f.updates).toHaveLength(count); expect(f.deliveries.get(draft.id)?.reason).toBe(decision);
+  // 確定後の続報は本文だけを書き換え、結果の編集はやり直さない。
+  const count = f.updates.length; const edits = f.edits.length; f.followUp(draft, "104"); await f.review.flush();
+  expect(f.updates).toHaveLength(count + 1); expect(f.edits).toHaveLength(edits);
+  expect(f.deliveries.get(draft.id)?.reason).toBe(decision);
 });
 
 for (const [error, delay, reason] of [

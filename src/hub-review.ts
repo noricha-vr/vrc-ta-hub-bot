@@ -144,18 +144,21 @@ export class HubReview {
     const draft = this.extracted.get(id)!;
     const closed = row.state === "closed" && ["approved", "rejected"].includes(row.reason);
     // 未同期の続報を表示して、同期済みと記録しない。
-    if (!closed && row.synced_hash !== fingerprint(draft)) return;
+    const synced = row.synced_hash === fingerprint(draft);
+    if (!closed && !synced) return;
     const name = discordText(row.reviewer_display_name);
     const result = `${row.reason === "approved" ? "承認済み" : "却下"}${name ? `（${name}）` : ""}`;
     for (const pending of this.deliveries.dueNotifications(this.now(), id)) {
       if (!closed && !this.matchesTarget(pending, setting)) continue;
       try {
         const reference = { channelId: pending.channel_id, messageId: pending.message_id };
-        if (closed) {
+        if (closed && !pending.edited) {
           await this.gateway.editNotification(reference, result);
           this.deliveries.notificationEdited(pending);
           this.log("hub_review_notification_edited");
         } else {
+          // 確定後の続報は、末尾の結果とリンクを残したまま本文だけ書き換える。
+          if (!synced) continue;
           await this.gateway.updateNotification(reference, this.notificationView(row, draft, setting));
           this.deliveries.notificationUpdated(pending, row.synced_hash);
           this.log("hub_review_notification_updated");
