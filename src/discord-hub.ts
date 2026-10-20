@@ -5,7 +5,7 @@ import {
 } from "discord.js";
 import type { HubInteraction, HubView } from "./hub-setup";
 
-export const hubCommand = new SlashCommandBuilder().setName("hub").setDescription("ハブ連携の設定")
+export const hubCommand = new SlashCommandBuilder().setName("hub").setDescription("Hub 連携の設定")
   .setDMPermission(false)
   .addSubcommand(c => c.setName("setup").setDescription("集会・応募チャンネル・通知先を設定"))
   .addSubcommand(c => c.setName("status").setDescription("設定と最近の下書きを確認"))

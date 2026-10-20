@@ -181,7 +181,7 @@ test("重複受信・再起動でも作成と通知を繰り返さず、続報�
   expect(f.notifications[0]!.nonce).not.toBe(f.notifications[1]!.nonce);
 });
 
-test("ハブ停止中は送信待ちを保持し、再起動後の復旧で取りこぼさず送る", async () => {
+test("Hub 停止中は送信待ちを保持し、再起動後の復旧で取りこぼさず送る", async () => {
   const f = fixture(); const draft = f.create(); f.setEventsDown(true);
   await f.review.flush();
   expect(f.createCount).toBe(0); expect(f.notifications).toHaveLength(0);
@@ -307,7 +307,7 @@ test("障害中は 5 人分まで保留し、6 人目は保存も送信もしな
   const pending = f.deliveries.decisions(draft.id);
   const before = f.calls.length;
   const sixth = interaction(draft.id, "rejected", "100", actors[5]!); await f.review.handle(sixth.i);
-  expect(sixth.views[0]!.content).toBe("ハブに接続できません。復旧後にもう一度押してください");
+  expect(sixth.views[0]!.content).toBe("Hub に接続できません。復旧後にもう一度押してください");
   expect(f.deliveries.decision(draft.id, actors[5]!)).toBeUndefined();
   expect(f.deliveries.decisions(draft.id)).toEqual(pending);
   expect(f.calls).toHaveLength(before); expect(f.log).toContain("hub_review_queue_full");
@@ -369,7 +369,7 @@ for (const role of ["owner", "staff"] as const) test(`setup 済みの ${role} �
   const before = f.calls.length;
   const sixthId = String(BigInt(userId) + 5n);
   const sixth = interaction(draft.id, "rejected", "100", sixthId); await f.review.handle(sixth.i);
-  expect(sixth.views[0]!.content).toBe("ハブに接続できません。復旧後にもう一度押してください");
+  expect(sixth.views[0]!.content).toBe("Hub に接続できません。復旧後にもう一度押してください");
   expect(f.deliveries.decision(draft.id, sixthId)).toBeUndefined();
   expect(f.deliveries.decisions(draft.id)).toHaveLength(6); expect(f.calls).toHaveLength(before);
   f.reopen(); f.advance(300); f.setReviewStatus(200); await f.review.flush();
@@ -396,7 +396,7 @@ test("確認済み主催者は未確認の 5 人枠を使わず、再送は全�
   const sixthId = String(BigInt(userId) + 5n);
   const sixth = interaction(first.id, "rejected", "100", sixthId); const before = f.calls.length;
   await f.review.handle(sixth.i);
-  expect(sixth.views[0]!.content).toBe("ハブに接続できません。復旧後にもう一度押してください");
+  expect(sixth.views[0]!.content).toBe("Hub に接続できません。復旧後にもう一度押してください");
   expect(f.deliveries.decision(first.id, sixthId)).toBeUndefined(); expect(f.calls).toHaveLength(before);
   f.reopen(); f.advance(300); await f.review.flush();
   expect(f.calls.slice(before).filter(c => c.path.endsWith("/review/")).map(c => [c.path, c.body?.discord_id])).toEqual([
@@ -461,7 +461,7 @@ for (const failure of [201, 202, 204, 403, 409, 503, "timeout"] as const) test(`
     { path: "/api/v1/event-details/42/review/", method: "POST", body: { decision: "rejected", discord_id: userId } },
     ...(failure === 403 ? [] : [{ path: "/api/v1/event-details/", method: "GET" }]),
   ]);
-  expect(other.views[0]!.content).toContain(failure === 403 ? "主催者ではありません" : failure === 409 ? "処理済み" : "ハブに接続できません");
+  expect(other.views[0]!.content).toContain(failure === 403 ? "主催者ではありません" : failure === 409 ? "処理済み" : "Hub に接続できません");
   if (failure === 409) {
     expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
     expect(f.deliveries.decisions(draft.id)).toEqual([]);
@@ -729,7 +729,7 @@ test("抽出の保存直後に停止しても、受信箱の重複を ack して
   expect(f.settings.messages("10")).toEqual([]); expect(f.createCount).toBe(1);
 });
 
-test("受信箱から応募・続報を処理し、本文を消した後も停止中のハブへ配送できる", async () => {
+test("受信箱から応募・続報を処理し、本文を消した後も停止中の Hub へ配送できる", async () => {
   const f = fixture(); const gateway = new FakeGateway();
   const judge: Judge = { ask: async (request: JudgeRequest) => {
     const key = Object.keys(request.questions)[0]!;

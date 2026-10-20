@@ -162,7 +162,7 @@ export class HubReview {
     const notificationHash = fingerprint([row.synced_hash, setting.notification]);
     if (row.notified_hash !== notificationHash) {
       const view: HubView = {
-        content: `承認待ちの発表があります。ハブで内容を確認してください。\n${discordText(draft.eventDate)} ${discordText(draft.title).slice(0, 300)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\n${draft.sources[0]!.url}`,
+        content: `承認待ちの発表があります。 Hub で内容を確認してください。\n${discordText(draft.eventDate)} ${discordText(draft.title).slice(0, 300)}\n発表者：${discordText(draft.presenterName).slice(0, 300)}\n${draft.sources[0]!.url}`,
         controls: [{ type: "buttons", buttons: [
           { id: `hub-review:${row.draft_id}:approved`, label: "承認" },
           { url: this.hub.editUrl(row.hub_id!), label: "直す" },
@@ -236,7 +236,7 @@ export class HubReview {
       if (!row || !row.hub_id || (i.guildId !== null && i.guildId !== row.guild_id) || !this.setting(row)) {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
-      if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
+      if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。 Hub で現在の状態を確認してください。")); return; }
       if (this.sending.get(row.draft_id) === i.userId) {
         await i.edit(text("前の操作を送信中です。結果が出てから押し直してください")); return;
       }
@@ -244,7 +244,7 @@ export class HubReview {
       const pending = this.deliveries.decision(row.draft_id, i.userId);
       if (!this.deliveries.queueDecision(row.draft_id, decision, i.userId, this.now())) {
         this.log("hub_review_queue_full");
-        await i.edit(text("ハブに接続できません。復旧後にもう一度押してください")); return;
+        await i.edit(text("Hub に接続できません。復旧後にもう一度押してください")); return;
       }
       if (pending) {
         await i.edit(text(pending.decision !== decision
@@ -254,7 +254,7 @@ export class HubReview {
       // 他人の送信中も本人の判断を保存し、同じ下書きへの操作を順番に送る。
       unlock = await this.lock(row.draft_id);
       row = this.deliveries.get(row.draft_id)!;
-      if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。ハブで現在の状態を確認してください。")); return; }
+      if (row.state === "closed") { await i.edit(text("この発表はすでに処理済みです。 Hub で現在の状態を確認してください。")); return; }
       if (!this.setting(row)) {
         await i.edit(text("この通知は古くなりました。/hub status で現在の設定を確認してください。")); return;
       }
@@ -265,11 +265,11 @@ export class HubReview {
       } catch {
         this.deliveries.retryDecision(row.draft_id, i.userId, this.now());
         this.log("hub_review_retry");
-        await i.edit(text("ハブに接続できません。操作を保存しました。復旧後に同じ操作を再送します。"));
+        await i.edit(text("Hub に接続できません。操作を保存しました。復旧後に同じ操作を再送します。"));
         return;
       }
       await i.edit(text(outcome === "forbidden" ? "この発表を承認・却下できる主催者ではありません。"
-        : outcome === "processed" ? "この発表はすでに処理済みです。ハブで現在の状態を確認してください。"
+        : outcome === "processed" ? "この発表はすでに処理済みです。 Hub で現在の状態を確認してください。"
         : current.decision === "approved" ? "承認しました。" : "却下しました。"));
     } catch {
       this.log("hub_review_failed");

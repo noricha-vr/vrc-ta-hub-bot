@@ -31,7 +31,7 @@ const classification: ChoiceQuestion = {
   },
 };
 
-/** 候補を返す部品。ハブ登録・通知・受信処理への自動接続は行わない。 */
+/** 候補を返す部品。 Hub 登録・通知・受信処理への自動接続は行わない。 */
 export class PostExtractor {
   private readonly totals: Record<ExtractionResult["status"], number> = {
     candidate: 0, duplicate: 0, review: 0, unrelated: 0, retry: 0,
