@@ -3,6 +3,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ChannelType, Client, PermissionFlagsBits } from "discord.js";
+import { clientOptions, DiscordGateway } from "../src/discord-gateway";
 import { HubBot } from "../src/bot";
 import type { HubCommunity } from "../src/hub-api";
 import { HubSetup, setupBaseline, type HubInteraction, type HubView } from "../src/hub-setup";
@@ -82,6 +84,31 @@ test("no eligible membership refuses setup and makes no persistent changes", asy
   expect(view.controls).toEqual([]);
   expect(f.store.settings()).toEqual([]);
   expect(f.gateway.validations).toEqual([]);
+});
+
+for (const type of [ChannelType.GuildText, ChannelType.GuildAnnouncement])
+test(`通知先 (${type}) に履歴の閲覧権限が無いと setup を保存せず必要な権限を日本語で返す`, async () => {
+  const f = fixture();
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  let canReadHistory = false;
+  client.channels.fetch = (async (id: string) => ({
+    type, guildId: "100",
+    guild: { members: { me: { id: "20" }, fetch: async () => ({ id: userId }) } },
+    permissionsFor: (member: { id: string }) => ({ has: (flags: bigint[]) =>
+      member.id === userId || id !== "12" || canReadHistory || !flags.includes(PermissionFlagsBits.ReadMessageHistory) }),
+  })) as unknown as typeof client.channels.fetch;
+  f.gateway.validateChannels = gateway.validateChannels.bind(gateway);
+  try {
+    const view = await f.setup(["10"], 1, "channel");
+    expect(view.content).toContain("メッセージ履歴を読む");
+    expect(view.controls).toEqual([]);
+    expect(f.store.settings()).toEqual([]);
+    expect(f.logs).not.toContain("hub_setup_saved");
+    canReadHistory = true;
+    expect((await f.setup(["10"], 1, "channel")).content).toContain("保存しました");
+    expect(f.store.settings()[0]?.notification).toEqual({ type: "channel", channelId: "12" });
+  } finally { await gateway.stop(); }
 });
 
 test("multiple channels and notification persist across restart without source message bodies", async () => {

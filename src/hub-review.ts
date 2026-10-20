@@ -140,9 +140,19 @@ export class HubReview {
         await this.gateway.editNotification({ channelId: pending.channel_id, messageId: pending.message_id }, result);
         this.deliveries.notificationEdited(pending);
         this.log("hub_review_notification_edited");
-      } catch {
-        this.deliveries.retryNotification(pending, this.now());
-        this.log("hub_review_notification_retry");
+      } catch (error) {
+        const { code, status } = error && typeof error === "object"
+          ? error as { code?: unknown; status?: unknown } : {};
+        const reason = code === 10008 ? "unknown_message" : code === 10003 ? "unknown_channel"
+          : status === 404 ? "not_found" : undefined;
+        if (reason) {
+          this.deliveries.notificationClosed(pending, reason);
+          this.log(`hub_review_notification_${reason}`);
+        } else {
+          const forbidden = status === 403 || code === 50001 || code === 50013;
+          this.deliveries.retryNotification(pending, this.now(), forbidden);
+          this.log(forbidden ? "hub_review_notification_forbidden" : "hub_review_notification_retry");
+        }
       }
     }
   }

@@ -86,10 +86,20 @@ test("channel validation rejects cross-guild, non-text, and insufficient permiss
     await expect(validateHubChannels(client, "100", ["10"], "read", "30")).rejects.toThrow("permissions");
     channel = { ...valid, permissionsFor: (member: unknown) => ({ has: (flags: bigint[]) =>
       (member as { id: string }).id === "30" || !Array.isArray(flags) || !flags.includes(PermissionFlagsBits.SendMessages) }) };
-    await expect(validateHubChannels(client, "100", ["10"], "notify", "30")).rejects.toThrow("permissions");
+    await expect(validateHubChannels(client, "100", ["10"], "notify", "30")).rejects.toThrow("メッセージを送信");
     channel = null;
     await expect(validateHubChannels(client, "100", ["10"], "read", "30")).rejects.toThrow("this guild");
   } finally { client.channels.fetch = original; await client.destroy(); }
+});
+
+test("通知先の取得が null なら編集を終了できる Unknown Channel として返す", async () => {
+  const client = new Client(clientOptions);
+  const gateway = new DiscordGateway(client);
+  client.channels.fetch = (async () => null) as unknown as typeof client.channels.fetch;
+  try {
+    await expect(gateway.editNotification({ channelId: "11", messageId: "501" }, "承認済み"))
+      .rejects.toMatchObject({ code: 10003, status: 404 });
+  } finally { await gateway.stop(); }
 });
 
 test("slash registration uses the existing client command manager only after ready", async () => {

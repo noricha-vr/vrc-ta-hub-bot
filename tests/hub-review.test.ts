@@ -34,6 +34,7 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   let patchDown = false;
   let notifyDown = false;
   let editDown = false;
+  let editError: unknown;
   const edits: Array<{ reference: { channelId: string; messageId: string }; result: string }> = [];
   let lookupDown = false;
   let createFailure: "none" | "lost" | "unconfirmed" | "saved" | "unreadable" = "none";
@@ -103,6 +104,7 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
     return { channelId: target.type === "channel" ? target.channelId : "900", messageId: String(500 + notifications.length) };
   }, editNotification: async (reference: { channelId: string; messageId: string }, result: string) => {
     edits.push({ reference, result });
+    if (editError) throw editError;
     if (editDown) throw new Error("Synthetic edit failure");
   } };
   const makeReview = () => new HubReview(gateway, settings, extracted, deliveries, hub, event => log.push(event), () => now);
@@ -117,6 +119,7 @@ function fixture(setupRole: "owner" | "staff" = "owner") {
   return {
     get settings() { return settings; }, get extracted() { return extracted; }, dir, hub, log, notifications, calls, create, followUp, edits,
     setEditDown: (value: boolean) => { editDown = value; },
+    setEditError: (value: unknown) => { editError = value; },
     get review() { return review; }, get deliveries() { return deliveries; }, get createCount() { return createCount; },
     get savedCount() { return savedCount; },
     advance: (seconds = 30000) => { now += seconds; },
@@ -311,7 +314,9 @@ for (const decision of ["approved", "rejected"]) test(`${decision} は押した�
   expect(f.calls.filter(c => c.path.endsWith("/review/"))).toHaveLength(1); expect(f.notifications).toHaveLength(1);
 });
 
-for (const status of [403, 409]) test(`${status} は押した人に理由を返し、元の通知を変更しない`, async () => {
+for (const status of [403, 409]) test(status === 403
+  ? "403 は押した人に理由を返し、元の通知を変更しない"
+  : "409 は Hub の状態を読み、通知を編集して処理済みと返す", async () => {
   const f = fixture(); const draft = f.create(); await f.review.flush();
   const original = JSON.stringify(f.notifications); f.setReviewStatus(status);
   if (status === 409) f.setFound([{ id: 42, source_url: source.url, source: "discord_bot", status: "approved" }]);
@@ -321,9 +326,62 @@ for (const status of [403, 409]) test(`${status} は押した人に理由を返�
   expect(f.deliveries.get(draft.id)?.state).toBe(status === 403 ? "ready" : "closed");
   expect(f.deliveries.decisions(draft.id)).toEqual([]);
   if (status === 403) {
+    expect(f.edits).toHaveLength(0);
     f.setReviewStatus(200); const owner = interaction(draft.id, "approved", "100", "223456789012345678");
     await f.review.handle(owner.i); expect(owner.views[0]!.content).toContain("承認しました");
   }
+});
+
+for (const [error, reason] of [
+  [{ code: 10008, status: 404 }, "unknown_message"],
+  [{ code: 10008 }, "unknown_message"],
+  [{ code: 10003, status: 404 }, "unknown_channel"],
+  [{ code: 10003 }, "unknown_channel"],
+  [{ status: 404 }, "not_found"],
+] as const) test(`通知編集の ${reason} (${JSON.stringify(error)}) は終了状態を保存し再試行しない`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditError(Object.assign(new Error("Synthetic missing notification"), error));
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.edits).toHaveLength(1);
+  expect(f.deliveries.get(draft.id)).toMatchObject({ state: "closed", reason: "approved" });
+  expect(f.deliveries.counts().retry).toBe(0);
+  const db = new Database(join(f.dir, "state.sqlite"));
+  try {
+    expect(db.query("SELECT closed_reason FROM hub_review_notifications WHERE message_id = '501'").get())
+      .toEqual({ closed_reason: reason });
+  } finally { db.close(); }
+  expect(f.log).toContain(`hub_review_notification_${reason}`);
+  f.reopen(); f.advance(); await f.review.flush();
+  await f.review.handle({ ...interaction(draft.id).i, notification: { channelId: "11", messageId: "501" } });
+  expect(f.edits).toHaveLength(1);
+  expect(f.deliveries.dueNotifications(Number.MAX_SAFE_INTEGER)).toEqual([]);
+});
+
+for (const error of [{ status: 500 }, { status: 503 }, { status: 429 }, { code: "ECONNRESET" }])
+test(`通知編集の一時障害 ${JSON.stringify(error)} は待ち間隔付きで再試行する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditError(Object.assign(new Error("Synthetic temporary failure"), error));
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.deliveries.counts().retry).toBe(1);
+  f.reopen(); f.advance(299); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.setEditError(undefined); f.advance(599); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.deliveries.counts().retry).toBe(0);
+});
+
+for (const error of [{ code: 50001 }, { code: 50013 }, { status: 403 }])
+test(`通知編集の権限不足 ${JSON.stringify(error)} はログを残し 6 時間ごとに再試行する`, async () => {
+  const f = fixture(); const draft = f.create(); await f.review.flush();
+  f.setEditError(Object.assign(new Error("Synthetic forbidden"), error));
+  await f.review.handle(interaction(draft.id).i);
+  expect(f.log).toContain("hub_review_notification_forbidden");
+  expect(f.deliveries.counts().retry).toBe(1);
+  f.reopen(); f.advance(21599); await f.review.flush(); expect(f.edits).toHaveLength(1);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.reopen(); f.setEditError(undefined); f.advance(21599); await f.review.flush(); expect(f.edits).toHaveLength(2);
+  f.advance(1); await f.review.flush(); expect(f.edits).toHaveLength(3);
+  expect(f.deliveries.counts().retry).toBe(0);
 });
 
 test("レビューの障害時も押した人と判断を永続化し、復旧後に再送する", async () => {

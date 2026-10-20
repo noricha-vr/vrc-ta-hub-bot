@@ -134,7 +134,8 @@ export class DiscordGateway implements Gateway {
 
   async editNotification(reference: NotificationReference, result: string): Promise<void> {
     const channel = await this.client.channels.fetch(reference.channelId);
-    if (!channel || (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
+    if (!channel) throw Object.assign(new Error("Unknown notification channel"), { code: 10003, status: 404 });
+    if (channel.type !== ChannelType.DM && channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
       throw new Error("Invalid notification channel");
     }
     const message = await channel.messages.fetch({ message: reference.messageId, cache: false });

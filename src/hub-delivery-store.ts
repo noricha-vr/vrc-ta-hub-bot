@@ -37,6 +37,7 @@ export interface HubReviewNotification {
   edited: number;
   attempts: number;
   next_at: number;
+  closed_reason: string;
 }
 
 export interface HubReviewStats {
@@ -74,12 +75,16 @@ export class HubDeliveryStore {
       CREATE TABLE IF NOT EXISTS hub_review_notifications (
         draft_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
         edited INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+        closed_reason TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (channel_id, message_id)
       );
     `);
     // 旧形式の保留と再送時刻を、取り込み済みの行を上書きせずに移す。
     this.db.transaction(() => {
       const now = Math.floor(Date.now() / 1000);
+      if (!this.db.query<{ name: string }, []>("PRAGMA table_info(hub_review_notifications)").all().some(c => c.name === "closed_reason")) {
+        this.db.exec("ALTER TABLE hub_review_notifications ADD COLUMN closed_reason TEXT NOT NULL DEFAULT ''");
+      }
       for (const [table, column] of [["hub_deliveries", "reviewer_display_name"], ["hub_review_decisions", "display_name"]]) {
         if (!this.db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some(c => c.name === column)) {
           this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
@@ -148,17 +153,21 @@ export class HubDeliveryStore {
   dueNotifications(now: number, id?: string): HubReviewNotification[] {
     return this.db.query<HubReviewNotification, [number, string | null, string | null]>(`SELECT n.* FROM hub_review_notifications n
       JOIN hub_deliveries d ON d.draft_id = n.draft_id
-      WHERE d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0 AND n.next_at <= ?
+      WHERE d.state = 'closed' AND d.reason IN ('approved', 'rejected') AND n.edited = 0 AND n.closed_reason = '' AND n.next_at <= ?
         AND (? IS NULL OR n.draft_id = ?) ORDER BY n.rowid`).all(now, id ?? null, id ?? null);
   }
   notificationEdited(row: HubReviewNotification): void {
     this.db.query("UPDATE hub_review_notifications SET edited = 1, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ?")
       .run(row.channel_id, row.message_id);
   }
-  retryNotification(row: HubReviewNotification, now: number): void {
+  notificationClosed(row: HubReviewNotification, reason: "unknown_message" | "unknown_channel" | "not_found"): void {
+    this.db.query("UPDATE hub_review_notifications SET closed_reason = ?, attempts = 0, next_at = 0 WHERE channel_id = ? AND message_id = ? AND edited = 0")
+      .run(reason, row.channel_id, row.message_id);
+  }
+  retryNotification(row: HubReviewNotification, now: number, forbidden = false): void {
     const attempts = row.attempts + 1;
-    const delay = Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
-    this.db.query("UPDATE hub_review_notifications SET attempts = ?, next_at = ? WHERE channel_id = ? AND message_id = ? AND edited = 0")
+    const delay = forbidden ? 21600 : Math.min(300 * 2 ** Math.min(attempts - 1, 7), 21600);
+    this.db.query("UPDATE hub_review_notifications SET attempts = ?, next_at = ? WHERE channel_id = ? AND message_id = ? AND edited = 0 AND closed_reason = ''")
       .run(attempts, now + delay, row.channel_id, row.message_id);
   }
   retry(id: string, now: number, reason: string): void {
@@ -242,7 +251,7 @@ export class HubDeliveryStore {
         SELECT 1 FROM hub_settings s WHERE s.guild_id = d.guild_id AND s.community_id = d.community_id
       ) AND (
         (state = 'closed' AND reason IN ('approved', 'rejected') AND (attempts > 0 OR EXISTS (
-          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.edited = 0
+          SELECT 1 FROM hub_review_notifications n WHERE n.draft_id = d.draft_id AND n.edited = 0 AND n.closed_reason = ''
         ))) OR
         (state <> 'closed' AND (reason <> '' OR EXISTS (
           SELECT 1 FROM hub_review_decisions r WHERE r.draft_id = d.draft_id AND r.attempts > 0
